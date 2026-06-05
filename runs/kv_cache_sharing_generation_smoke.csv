@@ -1,0 +1,2 @@
+sample_id,context_tokens,cache_slots,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,shared_continuation_ce,full_text,shared_text
+0,64,8,4,0,0,0,0.0,0.0,0.023076537996530533,9.397735595703125,00|游戏开始, of the United States
