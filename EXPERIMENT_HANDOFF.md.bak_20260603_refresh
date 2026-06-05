@@ -1,0 +1,902 @@
+# Handoff: Cross-Model Attention Route / Evidence-Region Experiments
+
+本文档用于把当前项目的研究目标、已完成实验、关键结论和下一步工作交接给后续接手的人。
+
+远端项目目录：
+
+```bash
+/home/yezhe/恢复注意力图代码/注意力图恢复
+```
+
+推荐 Python 环境：
+
+```bash
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python
+```
+
+注意：远端非交互式 SSH 下直接用 `python3` 可能没有 `torch`，实验命令请优先使用上面的解释器。
+
+## 1. 当前问题背景
+
+最初目标是研究异构模型之间是否可以复用 sender 模型的 KV / attention route，具体来说：
+
+- sender 模型先计算 attention route；
+- receiver 模型利用 sender 的 route 或经过重排的 route；
+- 希望避免 receiver 对完整上下文重算 attention/KV。
+
+早期方案尝试过直接恢复或重排 token-level attention route，例如：
+
+```text
+sender route -> reranker -> route_hat
+```
+
+但实验逐步显示：异构模型之间，尤其是 Qwen 到 Llama，精确 token-level attention route 不稳定，直接让 receiver 复用 sender 的 attention 权重或 token 排序并不可靠。
+
+因此当前研究目标已经调整为：
+
+```text
+从 sender 的 K / attention 中提取 routing prior，
+让它指导 receiver 缩小 attention 重算范围。
+```
+
+也就是说，新的框架不是“恢复完整 attention 矩阵”，而是：
+
+```text
+sender 负责召回证据区域；
+receiver 在候选区域内重新计算自己的 attention weight 和 attention output。
+```
+
+这个目标更符合目前实验现象：token 级别精确匹配弱，但 block/span 级别候选区域可以覆盖 receiver 大部分 attention mass，并且 selective recompute 的输出余弦相似度较高。
+
+## 2. 使用的模型和数据
+
+主要 sender：
+
+```bash
+/home/yezhe/all_models/hub/models/Qwen/Qwen3-0___6B
+```
+
+主要 receiver：
+
+```bash
+/home/yezhe/all_models/models/LLM-Research/Llama-3___2-1B-Instruct
+```
+
+也做过 Qwen -> Qwen 对照：
+
+```bash
+/home/yezhe/all_models/hub/models/Qwen/Qwen3-1___7B
+```
+
+长文本数据主要来自：
+
+```bash
+/home/yezhe/demo/train/**/*.txt
+```
+
+常用实验配置：
+
+```text
+num_samples = 8
+max_length = 512
+layers = 8,12,15
+```
+
+这些配置主要用于快速验证趋势，不是最终大规模实验。
+
+## 3. 已完成的主要实验
+
+### 3.1 token-level route 相似性实验
+
+脚本：
+
+```bash
+compare_model_important_tokens.py
+```
+
+作用：
+
+- 比较两个模型的 attention top-k route 是否相似；
+- 比较两个模型的 global important tokens 是否相似；
+- 使用 tokenizer offset/span alignment，而不是简单 position alignment。
+
+关键结论：
+
+- Qwen -> Llama 的 per-query route overlap 很低；
+- Qwen -> Qwen 的 route overlap 明显更高；
+- global important tokens 比 per-query route 更稳定；
+- 不同 tokenizer 之间必须用 span alignment，否则 position alignment 会高估相似性。
+
+已有结果：
+
+```bash
+runs/important_token_qwen_llama_len512_n8.csv
+runs/important_token_qwen_qwen_len512_n8.csv
+```
+
+大致现象：
+
+```text
+Qwen -> Llama:
+route_jaccard 通常约 0.07~0.08
+global_jaccard 可到约 0.18~0.52
+
+Qwen -> Qwen:
+route_jaccard 明显更高，部分层可到 0.16~0.49
+global_jaccard 也更高，部分层可接近 1.0
+```
+
+结论：异构模型之间不应继续押注精确 token-level route 一致。
+
+### 3.2 cross-model oracle candidate 实验
+
+脚本：
+
+```bash
+cross_model_oracle_candidates.py
+```
+
+作用：
+
+- 判断 sender 选出的候选 token 映射到 receiver 后，能覆盖 receiver gold attention top-k 的多少；
+- 新增 `--alignment span|position`；
+- 默认应使用 `span`。
+
+关键结论：
+
+- position alignment 会明显高估跨 tokenizer 模型的候选覆盖；
+- span alignment 后，Qwen -> Llama 的 oracle coverage 明显下降；
+- 这进一步说明 token-level 精确 route 不适合做最终目标。
+
+### 3.3 evidence recall + selective recompute 实验
+
+脚本：
+
+```bash
+evidence_recall_selective_recompute.py
+```
+
+作用：
+
+用 sender 产生候选区域，然后让 receiver 在候选区域内重算自己的 attention output。
+
+测试过的候选策略：
+
+```text
+attn_topk
+global_important
+k_saliency
+block_saliency
+union
+attn_topk_recv_block
+global_important_recv_block
+k_saliency_recv_block
+block_saliency_recv_block
+union_recv_block
+```
+
+核心指标：
+
+```text
+selected_tokens: 平均保留 token 数
+selected_ratio: 保留 token 比例
+candidate_mass: 候选区域覆盖 receiver attention mass 的比例
+gold_topk_recall: receiver gold top-k token 被候选区域召回的比例
+oracle_out_mse / oracle_out_cosine: oracle restricted output 与 full output 的误差/相似度
+selective_recompute_mse / selective_recompute_cosine: 实际候选区域重算 output 与 full output 的误差/相似度
+```
+
+已有结果：
+
+```bash
+runs/evidence_recall_qwen_to_llama_len512_n8.csv
+runs/evidence_recall_block16_qwen_to_llama_len512_n8.csv
+runs/evidence_recall_block_qwen_to_llama_len512_n8.csv
+runs/evidence_recall_block64_qwen_to_llama_len512_n8.csv
+```
+
+关键结论：
+
+- token-level candidate 很弱；
+- receiver block expansion 后效果大幅提升；
+- `union_recv_block` 效果最好，但保留 token 比例较高。
+
+典型结果，block size = 32：
+
+```text
+L08 union_recv_block:
+selected_ratio ≈ 0.636
+candidate_mass ≈ 0.8405
+gold_topk_recall ≈ 0.8420
+selective_recompute_cosine ≈ 0.9522
+
+L12 union_recv_block:
+selected_ratio ≈ 0.676
+candidate_mass ≈ 0.8471
+gold_topk_recall ≈ 0.8462
+selective_recompute_cosine ≈ 0.9500
+
+L15 union_recv_block:
+selected_ratio ≈ 0.670
+candidate_mass ≈ 0.8533
+gold_topk_recall ≈ 0.8516
+selective_recompute_cosine ≈ 0.9576
+```
+
+这说明 block/span 级 evidence region 是目前最可靠方向。
+
+### 3.4 fixed-budget 公平对比实验
+
+脚本：
+
+```bash
+fixed_budget_fair_compare.py
+```
+
+这是目前最重要的 baseline 实验。原因是 block expansion 会天然保留更多 token，所以必须在固定保留率下比较 sender-guided 方法是否真的优于随机、recent、uniform。
+
+比较方法：
+
+```text
+random_token
+random_block
+recent_token
+recent_block
+uniform_block
+sender_attn_block
+sender_k_norm
+sender_k_norm_block
+sender_received
+sender_received_block
+sender_kxreceived
+sender_kxreceived_block
+```
+
+已有结果：
+
+```bash
+runs/fixed_budget_fair_compare_qwen_to_llama_len512_n8.csv
+```
+
+关键结论：
+
+在相同 token/block 保留率下，sender-guided block 明显优于 random / recent / uniform，说明 sender 的 K/attention 中确实存在可迁移 routing prior。
+
+典型结果：
+
+```text
+Layer 8, budget 0.2:
+random_block        mass=0.1882  cos=0.7072
+uniform_block       mass=0.5329  cos=0.7613
+sender_attn_block   mass=0.6014  cos=0.8536
+sender_kxreceived   mass=0.5966  cos=0.8019
+
+Layer 8, budget 0.4:
+random_block        mass=0.3753  cos=0.8095
+uniform_block       mass=0.6017  cos=0.9058
+sender_attn_block   mass=0.7798  cos=0.9284
+sender_k_norm_block mass=0.6736  cos=0.9046
+
+Layer 12, budget 0.2:
+random_block        mass=0.1884  cos=0.7216
+uniform_block       mass=0.5856  cos=0.8437
+sender_attn_block   mass=0.5839  cos=0.8758
+sender_kxreceived   mass=0.6595  cos=0.8474
+
+Layer 12, budget 0.4:
+random_block        mass=0.3757  cos=0.8093
+uniform_block       mass=0.6469  cos=0.9121
+sender_attn_block   mass=0.7892  cos=0.9390
+sender_kxreceived   mass=0.7891  cos=0.9027
+```
+
+这条结果是支撑当前方向的关键证据。
+
+### 3.5 规则式 K-routing prior 实验
+
+脚本：
+
+```bash
+rule_k_routing_prior.py
+```
+
+比较了：
+
+```text
+k_norm
+received_mass
+k_norm_x_received
+k_outlier
+local_k_variance
+```
+
+已有结果：
+
+```bash
+runs/rule_k_routing_prior_qwen_to_llama_len512_n8.csv
+```
+
+关键结论：
+
+- `k_norm` / `k_outlier` 往往能取得较高 mass/cos，但选择范围偏大；
+- `received_mass` / `k_norm_x_received` 在高层更紧凑，效率更好；
+- 这说明 K 自身强度和 sender attention received mass 都有价值，后续可以组合为更强的 block scorer。
+
+典型结果：
+
+```text
+L08 k_outlier:
+selected_ratio ≈ 0.703
+candidate_mass ≈ 0.8430
+recompute_cos ≈ 0.9522
+
+L12 k_norm:
+selected_ratio ≈ 0.717
+candidate_mass ≈ 0.8431
+recompute_cos ≈ 0.9499
+
+L15 k_norm_x_received:
+selected_ratio ≈ 0.589
+candidate_mass ≈ 0.8322
+recompute_cos ≈ 0.9538
+```
+
+### 3.6 block/span routing sweep
+
+脚本：
+
+```bash
+block_span_routing_experiment.py
+```
+
+该脚本是对 `evidence_recall_selective_recompute.py` 的 sweep 入口，主要扫：
+
+```text
+block_size = 16, 32, 64
+anchor_k = 16, 32
+```
+
+已有结果：
+
+```bash
+runs/block_span_routing_b16_k16.csv
+runs/block_span_routing_b16_k32.csv
+runs/block_span_routing_b32_k16.csv
+runs/block_span_routing_b32_k32.csv
+runs/block_span_routing_b64_k16.csv
+runs/block_span_routing_b64_k32.csv
+```
+
+关键结论：
+
+- block size 增大通常会提高 mass/cos，但 selected_ratio 也明显增加；
+- `block_size=32, anchor_k=16` 是当前较好的折中；
+- `anchor_k=32` 会继续提升一点效果，但成本明显增加；
+- `block_size=64` 的额外收益不大，很多时候只是保留更多 token。
+
+典型折中结果，block size = 32, anchor k = 16：
+
+```text
+L08 union_recv_block:
+selected_ratio=0.510
+candidate_mass=0.7885
+recompute_cos=0.9449
+
+L12 union_recv_block:
+selected_ratio=0.506
+candidate_mass=0.8025
+recompute_cos=0.9449
+
+L15 union_recv_block:
+selected_ratio=0.580
+candidate_mass=0.8374
+recompute_cos=0.9559
+```
+
+### 3.7 learned block routing predictor MVP
+
+脚本：
+
+```bash
+train_block_routing_predictor.py
+```
+
+作用：
+
+训练一个轻量 predictor，用 sender block 特征预测 receiver 需要保留的 block。
+
+当前输入特征：
+
+```text
+K norm mean/max
+K variance
+received attention mean/max
+```
+
+训练标签：
+
+```text
+receiver oracle top blocks by gold attention mass
+```
+
+已有结果：
+
+```bash
+runs/train_block_routing_predictor_qwen_to_llama_len512_n8.csv
+```
+
+当前结论：
+
+MVP 能跑通，但效果弱于手工规则。
+
+典型结果：
+
+```text
+L08 learned:
+selected_ratio≈0.377
+candidate_mass≈0.3873
+recompute_cos≈0.8082
+
+L12 learned:
+selected_ratio≈0.370
+candidate_mass≈0.3956
+recompute_cos≈0.7989
+
+L15 learned:
+selected_ratio≈0.373
+candidate_mass≈0.4131
+recompute_cos≈0.9026
+```
+
+这说明 predictor 方向可以继续，但当前特征和训练目标还不够强，不能作为最终方法。
+
+### 3.8 output-equivalent region 实验
+
+脚本：
+
+```bash
+output_equivalent_region.py
+```
+
+作用：
+
+不再要求恢复 attention matrix，而是评价 restricted candidate region 中重算 receiver attention output 后，能否接近 full attention output。
+
+已有结果：
+
+```bash
+runs/output_equivalent_region_k16_b32.csv
+runs/output_equivalent_region_k32_b32.csv
+runs/output_equivalent_region_k64_b32.csv
+```
+
+关键结论：
+
+- `k=16, block_size=32` 已经能取得较高 output cosine；
+- `k=32` 有小幅提升；
+- `k=64` 收益很有限。
+
+典型结果：
+
+```text
+k=16, block=32, union_recv_block:
+L08 ratio=0.510  mass=0.7885  cos=0.9449
+L12 ratio=0.506  mass=0.8025  cos=0.9449
+L15 ratio=0.580  mass=0.8374  cos=0.9559
+
+k=32, block=32, union_recv_block:
+L08 ratio=0.636  mass=0.8405  cos=0.9522
+L12 ratio=0.676  mass=0.8471  cos=0.9500
+L15 ratio=0.670  mass=0.8533  cos=0.9576
+
+k=64, block=32, union_recv_block:
+L08 ratio=0.708  mass=0.8553  cos=0.9536
+L12 ratio=0.736  mass=0.8573  cos=0.9504
+L15 ratio=0.731  mass=0.8569  cos=0.9578
+```
+
+这支持把最终目标从 attention matrix recovery 改成 output recovery。
+
+## 4. 当前总判断
+
+目前最重要的结论是：
+
+```text
+异构模型 token-level attention route 不相似，
+但 sender 的 attention/K 仍然能作为 evidence region 的召回信号。
+```
+
+因此不建议继续追求：
+
+```text
+sender token i -> receiver token j
+sender attention weight -> receiver attention weight
+完整 attention matrix recovery
+```
+
+更建议继续推进：
+
+```text
+sender K / attention -> receiver evidence block/span
+receiver 在候选区域内选择性重算自己的 K/V 和 attention output
+```
+
+这条路线的优势：
+
+- 避开异构模型 attention 分布天然不一致的问题；
+- 保留 sender 作为 routing prior 的价值；
+- receiver 仍然使用自己的 Q/K/V 和 attention weight，语义上更合理；
+- fixed-budget 实验证明 sender-guided block 不是单纯因为保留更多 token，而是在相同预算下也优于 baseline。
+
+## 5. 下一步建议
+
+### 5.1 优先补强 fixed-budget 实验
+
+这是最重要的下一步。需要把当前快速实验扩大到：
+
+```text
+更多 sample
+更多 layer
+更多 budget: 10%, 20%, 30%, 40%, 50%, 60%
+更多模型组合: Qwen->Llama, Qwen->Qwen, 可能再加 Llama->Qwen
+```
+
+要重点确认：
+
+```text
+sender-guided block > random block / recent block / uniform block
+```
+
+只要这个结论稳定，整个方向就站得住。
+
+### 5.2 压缩 candidate ratio
+
+当前 `union_recv_block` 效果好，但保留比例偏高，经常在 50%~70%。下一步要在固定预算下优化 scorer，而不是无限扩大 block。
+
+重点探索：
+
+```text
+K norm
+K outlier
+received attention mass
+K norm × received mass
+local K variance
+multi-scale block score
+anchor-centered local window
+```
+
+目标是在 20%~40% token 保留率下尽量维持高 `candidate_mass` 和 `selective_recompute_cosine`。
+
+### 5.3 改进 learned predictor
+
+当前 predictor 只是 MVP，效果弱于规则方法。后续可以增强：
+
+```text
+更多 sender 特征
+多层特征
+head-level 特征
+position / relative position
+block 内 K 统计分布
+sender received mass 的多头统计
+pairwise/ranking loss
+固定预算 top-block loss
+```
+
+训练目标不应是完整 attention matrix，而应是：
+
+```text
+receiver high-mass block
+receiver oracle evidence region
+output-equivalent block mask
+```
+
+### 5.4 最终评价指标应转向 output recovery
+
+后续主指标建议使用：
+
+```text
+selected_ratio
+candidate_mass
+gold_topk_recall
+selective_recompute_mse
+selective_recompute_cosine
+```
+
+最终如果要更接近真实任务，还应补：
+
+```text
+generation perplexity
+downstream accuracy
+latency / FLOPs / KV memory saving
+```
+
+不要再把 attention overlap 当作唯一核心指标，因为异构模型 attention 分布不相似本身已经被实验确认。
+
+## 6. 常用命令
+
+### block/span sweep
+
+```bash
+cd /home/yezhe/恢复注意力图代码/注意力图恢复
+
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python block_span_routing_experiment.py \
+  --block_sizes 16,32,64 \
+  --anchor_ks 16,32 \
+  --num_samples 8 \
+  --max_length 512 \
+  --layers 8,12,15
+```
+
+### fixed-budget fair compare
+
+```bash
+cd /home/yezhe/恢复注意力图代码/注意力图恢复
+
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python fixed_budget_fair_compare.py \
+  --device cuda \
+  --text_glob '/home/yezhe/demo/train/**/*.txt' \
+  --num_samples 8 \
+  --max_length 512 \
+  --layers 8,12,15 \
+  --budgets 0.1,0.2,0.3,0.4,0.5,0.6 \
+  --csv runs/fixed_budget_fair_compare_qwen_to_llama_len512_n8.csv
+```
+
+### rule K-routing prior
+
+```bash
+cd /home/yezhe/恢复注意力图代码/注意力图恢复
+
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python rule_k_routing_prior.py \
+  --device cuda \
+  --text_glob '/home/yezhe/demo/train/**/*.txt' \
+  --num_samples 8 \
+  --max_length 512 \
+  --layers 8,12,15 \
+  --csv runs/rule_k_routing_prior_qwen_to_llama_len512_n8.csv
+```
+
+### learned block predictor
+
+```bash
+cd /home/yezhe/恢复注意力图代码/注意力图恢复
+
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python train_block_routing_predictor.py \
+  --device cuda \
+  --text_glob '/home/yezhe/demo/train/**/*.txt' \
+  --num_samples 8 \
+  --max_length 512 \
+  --layers 8,12,15 \
+  --csv runs/train_block_routing_predictor_qwen_to_llama_len512_n8.csv
+```
+
+### output-equivalent region
+
+```bash
+cd /home/yezhe/恢复注意力图代码/注意力图恢复
+
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python output_equivalent_region.py \
+  --anchor_ks 16,32,64 \
+  --block_size 32 \
+  --num_samples 8 \
+  --max_length 512 \
+  --layers 8,12,15
+```
+
+## 7. 给接手人的一句话
+
+不要继续把问题表述为“异构模型 attention route 是否一样”。目前实验已经说明它们大概率不一样。
+
+更准确的任务表述应该是：
+
+```text
+sender 模型能否从自己的 K/attention 中提供可迁移的 routing prior，
+帮助 receiver 在更小的 evidence region 内重算 attention output，
+并在固定 token budget 下优于随机、recent、uniform 等 baseline。
+```
+
+这个表述和当前实验结果一致，也更容易形成可辩护的方法路线。
+
+## 8. 最新补充：block-level translated memory recovery 实验
+
+脚本：
+
+```bash
+block_translated_memory_recovery.py
+```
+
+这个实验是在前面 evidence region / selective recompute 路线上的进一步版本。前面的主要设定是：
+
+```text
+sender 负责选 evidence region；
+receiver 在候选区域内用自己的历史 K/V 重新计算 attention output。
+```
+
+最新实验测试更激进的设定：
+
+```text
+sender 已经完成 prefill，持有 K_s / V_s / attention；
+sender 从 K_s / attention 中选出重要 block/span；
+sender 将 block-level K/V memory 通过轻量 T_k / T_v 映射到 receiver 可读空间；
+receiver 不完整计算历史 K/V，只用自己的 Q attend translated block memory；
+最终近似 receiver full attention output。
+```
+
+### 8.1 当前实现方式
+
+核心流程：
+
+```text
+1. 对齐 sender / receiver 的 token span。
+2. 以 receiver block 为单位，找到与该 block 字符 span 重叠的 sender tokens。
+3. 对 sender K_s 做 block pooling，得到 sender block K memory。
+4. 对 sender V_s 做 block pooling，得到 sender block V memory。
+5. 选择 top blocks 作为候选 block memory。
+6. 训练轻量线性映射：
+   T_k: sender block K -> receiver-readable block K
+   T_v: sender block V -> receiver-readable block V
+7. receiver 使用自己的 Q_r attend translated K/V memory，得到 translated output。
+8. 用 receiver full attention output 作为训练和评估目标。
+```
+
+注意，最新版已经修正两个关键点：
+
+```text
+K memory 用 routing_pool_mode 池化；
+V memory 用 value_pool_mode 池化。
+```
+
+也就是说，K 负责路由，应使用 routing prior 权重；V 负责内容，应使用内容保真权重。当前主实验用的是：
+
+```text
+routing_pool_mode = uniform / received / kxreceived
+value_pool_mode = uniform
+```
+
+这样避免把 V 的内容表示也被 routing saliency 过度扭曲。
+
+### 8.2 oracle 指标修正
+
+早期版本中 `oracle_block_cosine` 实际只是 receiver K/V 的 mean-pooled block memory 结果，不是真正 oracle。因此最新版已改名并新增指标：
+
+```text
+mean_block_cosine:
+    receiver mean-pooled block K/V memory baseline。
+    这不是 oracle，只是 block memory 压缩基线。
+
+selective_oracle_cosine:
+    真正 oracle。
+    在同样选中的 receiver blocks 内，使用 receiver token-level K/V 和 gold attention 做 selective recompute。
+    它表示候选 block 区域本身的理论上限。
+```
+
+这个区分很重要。现在可以判断瓶颈来自两部分：
+
+```text
+selective_oracle_cosine 高 -> 说明选中的 evidence region 本身足够好；
+translated_cosine 低于 selective_oracle_cosine -> 说明瓶颈在 sender memory -> receiver-readable memory 的翻译质量。
+```
+
+### 8.3 运行命令
+
+```bash
+cd /home/yezhe/恢复注意力图代码/注意力图恢复
+
+/home/yezhe/data/miniconda3/envs/attnkv/bin/python block_translated_memory_recovery.py \
+  --device cuda \
+  --text_glob '/home/yezhe/demo/train/**/*.txt' \
+  --num_samples 8 \
+  --max_length 512 \
+  --layers 8,12,15 \
+  --block_size 32 \
+  --budget_ratio 0.5 \
+  --pool_modes uniform,received,kxreceived \
+  --value_pool_mode uniform \
+  --epochs 30 \
+  --lr 0.001 \
+  --kv_loss_weight 0.1 \
+  --output_loss_weight 1.0 \
+  --csv runs/block_translated_memory_recovery_b32_r50_n8_v2.csv
+```
+
+结果文件：
+
+```bash
+runs/block_translated_memory_recovery_b32_r50_n8_v2.csv
+```
+
+### 8.4 当前结果
+
+配置：
+
+```text
+num_samples = 8
+max_length = 512
+layers = 8,12,15
+block_size = 32
+budget_ratio = 0.5
+value_pool_mode = uniform
+```
+
+结果：
+
+```text
+L08 uniform:
+selected_ratio=0.438
+translated_cosine=0.7403
+selective_oracle_cosine=0.8861
+mean_block_cosine=0.6356
+
+L08 received:
+selected_ratio=0.438
+translated_cosine=0.7391
+selective_oracle_cosine=0.9375
+mean_block_cosine=0.6595
+
+L08 kxreceived:
+selected_ratio=0.438
+translated_cosine=0.7410
+selective_oracle_cosine=0.9375
+mean_block_cosine=0.6595
+
+L12 uniform:
+selected_ratio=0.438
+translated_cosine=0.7054
+selective_oracle_cosine=0.9078
+mean_block_cosine=0.6247
+
+L12 received:
+selected_ratio=0.438
+translated_cosine=0.7016
+selective_oracle_cosine=0.9498
+mean_block_cosine=0.6299
+
+L12 kxreceived:
+selected_ratio=0.438
+translated_cosine=0.7016
+selective_oracle_cosine=0.9498
+mean_block_cosine=0.6299
+
+L15 uniform:
+selected_ratio=0.438
+translated_cosine=0.7319
+selective_oracle_cosine=0.9210
+mean_block_cosine=0.6761
+
+L15 received:
+selected_ratio=0.438
+translated_cosine=0.7405
+selective_oracle_cosine=0.9769
+mean_block_cosine=0.6928
+
+L15 kxreceived:
+selected_ratio=0.438
+translated_cosine=0.7407
+selective_oracle_cosine=0.9769
+mean_block_cosine=0.6928
+```
+
+### 8.5 当前判断
+
+这个实验说明：
+
+```text
+1. block-level evidence region 的 oracle 上限很高，尤其 received / kxreceived 路由下，
+   selective_oracle_cosine 可达到约 0.94~0.98。
+
+2. translated block memory 已经能达到约 0.70~0.74 的 output cosine，
+   并且明显高于 mean-pooled receiver block memory baseline 的部分结果。
+
+3. 当前主要瓶颈不再是 evidence region 是否能覆盖 receiver 需要的信息，
+   而是 sender block memory 如何更好地翻译成 receiver-readable memory。
+```
+
+因此下一步不应该只继续扩大 block 或 token ratio，而应该重点改进 memory translation：
+
+```text
+更强的 T_k / T_v：低秩 + 非线性、per-layer adapter、head-specific adapter；
+更合理的 V pooling：uniform、V norm、received、或内容保真 learned pooling；
+训练目标更偏 output recovery，而不是单纯拟合 receiver mean-pooled K/V；
+引入 block 内多 slot memory，而不是每个 block 只压成一个 memory；
+保留 recent receiver native K/V，与 translated old memory 混合。
+```

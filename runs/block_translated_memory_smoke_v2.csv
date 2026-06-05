@@ -1,0 +1,3 @@
+layer,routing_pool_mode,value_pool_mode,block_size,keep_blocks,budget_ratio,selected_ratio,translated_mse,translated_cosine,mean_block_mse,mean_block_cosine,selective_oracle_mse,selective_oracle_cosine
+0,uniform,uniform,32,,0.5,0.5,0.0027244421653449535,0.06931386888027191,0.0009503144538030028,0.6473555564880371,6.101722647144925e-06,0.9963833093643188
+0,received,uniform,32,,0.5,0.5,0.0030478816479444504,0.08145342767238617,0.0009503144538030028,0.6473555564880371,6.101722647144925e-06,0.9963833093643188

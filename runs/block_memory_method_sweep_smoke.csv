@@ -1,0 +1,7 @@
+layer,method,slot_mode,slots_per_block,translator,normalize,prior_alpha,block_score_mode,anchor_tokens,budget_ratio,selected_ratio,translated_mse,translated_cosine,selective_oracle_cosine
+8,baseline_1slot_linear,mean,1,linear,False,0.0,anchor_count,32,0.5,0.5,0.029245631769299507,0.07519011199474335,0.9731886982917786
+8,multislot_linear,top_tokens,4,linear,False,0.0,anchor_count,32,0.5,0.5,0.0837169736623764,0.006435247138142586,0.9731886982917786
+8,multislot_mlp,top_tokens,4,mlp,False,0.0,anchor_count,32,0.5,0.5,0.09524453431367874,0.061653900891542435,0.9731886982917786
+8,multislot_mlp_norm,top_tokens,4,mlp,True,0.0,anchor_count,32,0.5,0.5,0.01672910712659359,0.23894745111465454,0.9731886982917786
+8,multislot_headwise_norm,top_tokens,4,headwise,True,0.0,anchor_count,32,0.5,0.5,0.009634084068238735,0.48710471391677856,0.9731886982917786
+8,multislot_mlp_norm_prior,top_tokens,4,mlp,True,1.0,anchor_count,32,0.5,0.5,0.021336056292057037,0.15379668772220612,0.9731886982917786

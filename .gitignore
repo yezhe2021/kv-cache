@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+.venv/
+venv/
+env/
+.env
+.env.*
+
+*.log
+
+# Keep experiment outputs under runs/, including CSV summaries and small
+# checkpoint files, because this repository is the experiment handoff.
