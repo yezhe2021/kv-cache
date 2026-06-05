@@ -1,0 +1,2 @@
+sample_id,cache_source,context_tokens,cache_slots,cache_space,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,shared_continuation_ce,full_text,shared_text
+0,native_receiver_selected,128,48,pre_rope,8,1,0,3,0.5,0.5,0.89990234375,5.95703125,.00|游戏开始|9821,.00|552|241|899
