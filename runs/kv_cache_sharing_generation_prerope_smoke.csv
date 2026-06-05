@@ -1,0 +1,4 @@
+sample_id,cache_source,context_tokens,cache_slots,cache_space,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,shared_continuation_ce,full_text,shared_text
+0,full_receiver_cache,64,63,pre_rope,4,1,1,4,1.0,1.0,0.02301025390625,0.02301025390625,00|游戏开始,00|游戏开始
+0,native_receiver_selected,64,2,pre_rope,4,0,0,0,0.0,0.0,0.02301025390625,11.21875,00|游戏开始,**_The problem
+0,translated_sender,64,2,pre_rope,4,0,0,0,0.0,0.0,0.02301025390625,9.03125,00|游戏开始, of the 1
