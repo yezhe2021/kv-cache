@@ -11,11 +11,10 @@ goal:
 5. receiver decodes from only the last prompt token plus translated cache;
 6. generated continuations are compared with full receiver prefill+generate.
 
-Important limitation: current translators are trained on projected K/V tensors
-from the existing QKVExtractor path, while HuggingFace caches normally store
-post-RoPE key states. This experiment intentionally keeps the existing
-translator stack unchanged and measures whether that packed cache is useful as
-a first real-cache integration test.
+By default the translator is trained in real HuggingFace cache space: sender
+and receiver K/V come from model(..., use_cache=True).past_key_values. For
+training compatibility those KV-head tensors are repeated/aligned to receiver
+query heads, and folded back to receiver KV heads before DynamicCache packing.
 """
 
 import argparse
@@ -27,8 +26,29 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
-from attention_preserving_kv_translation_experiment import LOCAL_SENDER_MODEL, parse_int_list
-from block_memory_method_sweep import build_items, parse_method
+from attention_preserving_kv_translation_experiment import (
+    LOCAL_SENDER_MODEL,
+    align_heads,
+    attention_output,
+    attention_probs,
+    parse_int_list,
+)
+from block_memory_method_sweep import (
+    build_items,
+    build_receiver_slot_targets,
+    build_slots_for_block,
+    parse_method,
+    slot_attention,
+)
+from block_translated_memory_recovery import (
+    receiver_block_sender_masks,
+    score_blocks,
+    select_blocks,
+    selected_block_candidate_mask,
+    sender_token_weights,
+    sender_value_weights,
+    sparse_normalize,
+)
 from evidence_recall_selective_recompute import LLAMA_3_2_1B, collect_features, load_bundle, load_text_files
 from generation_effect_experiment import train_translators_return_models
 
@@ -48,6 +68,133 @@ def q_heads_to_kv_heads(x, q_heads, kv_heads):
     bsz, heads, seq_len, dim = x.shape
     group = q_heads // kv_heads
     return x.view(bsz, kv_heads, group, seq_len, dim).mean(dim=2).contiguous()
+
+
+@torch.no_grad()
+def collect_hf_caches(bundle, texts, max_length, device):
+    caches = []
+    for text in texts:
+        enc = bundle.tokenizer(text, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt")
+        input_ids = enc["input_ids"].to(device)
+        mask = enc["attention_mask"].to(device)
+        out = bundle.model(input_ids=input_ids, attention_mask=mask, use_cache=True)
+        cache = out.past_key_values
+        caches.append(
+            {
+                "k": [layer.keys.detach().float() for layer in cache.layers],
+                "v": [layer.values.detach().float() for layer in cache.layers],
+            }
+        )
+    return caches
+
+
+def cache_heads_to_q_heads(x, target_heads):
+    return align_heads(x, target_heads)
+
+
+def build_cache_space_items(
+    features_s,
+    features_r,
+    caches_s,
+    caches_r,
+    layer,
+    block_size,
+    block_score_mode,
+    anchor_tokens,
+    budget_ratio,
+    config,
+    value_pool_mode,
+    device,
+):
+    items = []
+    for fs, fr, cs, cr in zip(features_s, features_r, caches_s, caches_r):
+        q_s = align_heads(fs["qkv"].q[layer].to(device), fr["qkv"].q[layer].shape[1])
+        q_r = fr["qkv"].q[layer].to(device)
+        target_heads = q_r.shape[1]
+
+        # Real cache-space K/V. They are post-cache tensors with native KV
+        # heads; repeat/align to receiver Q heads for existing slot attention
+        # and translator training.
+        k_s = cache_heads_to_q_heads(cs["k"][layer].to(device), target_heads)
+        v_s = cache_heads_to_q_heads(cs["v"][layer].to(device), target_heads)
+        k_r = cache_heads_to_q_heads(cr["k"][layer].to(device), target_heads)
+        v_r = cache_heads_to_q_heads(cr["v"][layer].to(device), target_heads)
+
+        s_mask = fs["mask"].to(device)
+        r_mask = fr["mask"].to(device)
+        seq_len = min(q_s.shape[-2], q_r.shape[-2], k_s.shape[-2], k_r.shape[-2], s_mask.shape[-1], r_mask.shape[-1])
+        q_s, q_r = q_s[:, :, :seq_len, :], q_r[:, :, :seq_len, :]
+        k_s, v_s = k_s[:, :, :seq_len, :], v_s[:, :, :seq_len, :]
+        k_r, v_r = k_r[:, :, :seq_len, :], v_r[:, :, :seq_len, :]
+        s_mask, r_mask = s_mask[:, :seq_len], r_mask[:, :seq_len]
+
+        attn_s = attention_probs(q_s, k_s, s_mask)
+        attn_r = attention_probs(q_r, k_r, r_mask)
+        full_out = attention_output(attn_r, v_r)
+        routing_weights = sender_token_weights(k_s, attn_s, s_mask, "kxreceived")
+        value_weights = sender_value_weights(v_s, attn_s, s_mask, value_pool_mode)
+        block_sender_masks, block_starts, block_ends, valid_from_sender = receiver_block_sender_masks(
+            fs["offsets"].to(device),
+            fr["offsets"].to(device),
+            r_mask,
+            block_size,
+            device,
+        )
+        valid_recv = torch.tensor([end > start for start, end in zip(block_starts.tolist(), block_ends.tolist())], dtype=torch.bool, device=device)
+        candidate_blocks = valid_from_sender & valid_recv
+        block_scores = score_blocks(
+            routing_weights,
+            block_sender_masks,
+            candidate_blocks,
+            mode=block_score_mode,
+            anchor_tokens=anchor_tokens,
+        )
+        valid_blocks = select_blocks(block_scores, candidate_blocks, keep_blocks=None, budget_ratio=budget_ratio)
+
+        k_slots, v_slots, slot_scores, slot_starts, valid_slots = [], [], [], [], []
+        for block_id in range(valid_blocks.shape[0]):
+            bk, bv, bs = build_slots_for_block(
+                k_s,
+                v_s,
+                routing_weights,
+                value_weights,
+                block_sender_masks[block_id],
+                valid_blocks[block_id],
+                config,
+            )
+            k_slots.extend(bk)
+            v_slots.extend(bv)
+            slot_scores.extend(bs)
+            for _ in range(config.slots_per_block):
+                slot_starts.append(block_starts[block_id])
+                valid_slots.append(valid_blocks[block_id])
+
+        sender_k_slots = torch.stack(k_slots, dim=2)
+        sender_v_slots = torch.stack(v_slots, dim=2)
+        slot_scores = torch.stack(slot_scores).to(device)
+        slot_starts = torch.stack(slot_starts).to(device)
+        valid_slots = torch.stack(valid_slots).to(device)
+        target_k_slots, target_v_slots = build_receiver_slot_targets(k_r, v_r, valid_blocks, block_starts, block_ends, config.slots_per_block)
+        candidate_mask = selected_block_candidate_mask(attn_r.shape, valid_blocks, block_starts, block_ends, r_mask, device)
+        selective_oracle_out = attention_output(sparse_normalize(attn_r, candidate_mask), v_r)
+
+        items.append(
+            {
+                "sender_k_slots": sender_k_slots,
+                "sender_v_slots": sender_v_slots,
+                "target_k_slots": target_k_slots,
+                "target_v_slots": target_v_slots,
+                "q_r": q_r,
+                "r_mask": r_mask,
+                "full_out": full_out,
+                "selective_oracle_out": selective_oracle_out,
+                "valid_slots": valid_slots,
+                "slot_starts": slot_starts,
+                "slot_scores": slot_scores,
+                "selected_ratio": float(valid_blocks.float().mean().cpu()),
+            }
+        )
+    return items
 
 
 @torch.no_grad()
@@ -173,6 +320,7 @@ def main():
     parser.add_argument("--anchor_tokens", type=int, default=64)
     parser.add_argument("--slots_per_block", type=int, default=4)
     parser.add_argument("--method", default="multislot_headwise_norm")
+    parser.add_argument("--cache_space", choices=["hf_cache", "raw_extractor"], default="hf_cache")
     parser.add_argument("--value_pool_mode", default="uniform")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -190,6 +338,11 @@ def main():
 
     features_s = collect_features(sender, texts, args.max_length, device)
     features_r = collect_features(receiver, texts, args.max_length, device)
+    caches_s = caches_r = None
+    if args.cache_space == "hf_cache":
+        print("Collecting sender/receiver HF past_key_values...")
+        caches_s = collect_hf_caches(sender, texts, args.max_length, device)
+        caches_r = collect_hf_caches(receiver, texts, args.max_length, device)
     method = parse_method(args.method, args.slots_per_block)
     if args.layers == "all":
         layers = list(range(receiver.model.config.num_hidden_layers))
@@ -201,18 +354,34 @@ def main():
 
     per_layer = {}
     for layer in layers:
-        items = build_items(
-            features_s,
-            features_r,
-            layer,
-            args.block_size,
-            args.block_score_mode,
-            args.anchor_tokens,
-            args.budget_ratio,
-            method,
-            args.value_pool_mode,
-            device,
-        )
+        if args.cache_space == "hf_cache":
+            items = build_cache_space_items(
+                features_s,
+                features_r,
+                caches_s,
+                caches_r,
+                layer,
+                args.block_size,
+                args.block_score_mode,
+                args.anchor_tokens,
+                args.budget_ratio,
+                method,
+                args.value_pool_mode,
+                device,
+            )
+        else:
+            items = build_items(
+                features_s,
+                features_r,
+                layer,
+                args.block_size,
+                args.block_score_mode,
+                args.anchor_tokens,
+                args.budget_ratio,
+                method,
+                args.value_pool_mode,
+                device,
+            )
         tk, tv, prep_input, denorm_pred = train_translators_return_models(
             items,
             method,
@@ -251,6 +420,7 @@ def main():
             "sample_id": sample_id,
             "context_tokens": context_len,
             "cache_slots": cache.get_seq_length(),
+            "cache_space": args.cache_space,
             "max_new_tokens": args.max_new_tokens,
             "first_token_match": int(bool(full_ids and shared_ids and full_ids[0] == shared_ids[0])),
             "exact_match": int(full_ids == shared_ids),
@@ -274,6 +444,7 @@ def main():
         "sample_id",
         "context_tokens",
         "cache_slots",
+        "cache_space",
         "max_new_tokens",
         "first_token_match",
         "exact_match",

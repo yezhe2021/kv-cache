@@ -1,0 +1,2 @@
+sample_id,context_tokens,cache_slots,cache_space,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,shared_continuation_ce,full_text,shared_text
+0,64,8,hf_cache,4,0,0,0,0.0,0.0,0.02301025390625,9.03125,00|游戏开始, of the 1
