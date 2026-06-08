@@ -1,0 +1,6 @@
+sample_id,layers,patch_source,alpha,context_tokens,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,boot_continuation_ce,full_text,boot_text
+0,"12,15",none,0.0,128,8,1,1,8,1.0,1.0,0.89990234375,0.89990234375,.00|游戏开始|9821,.00|游戏开始|9821
+0,"12,15",selective_oracle,1.0,128,8,1,1,8,1.0,1.0,0.89990234375,0.89990234375,.00|游戏开始|9821,.00|游戏开始|9821
+0,"12,15",selective_oracle,0.5,128,8,1,1,8,1.0,1.0,0.89990234375,0.89990234375,.00|游戏开始|9821,.00|游戏开始|9821
+0,"12,15",translated,1.0,128,8,1,1,8,1.0,1.0,0.89990234375,0.89990234375,.00|游戏开始|9821,.00|游戏开始|9821
+0,"12,15",translated,0.5,128,8,1,1,8,1.0,1.0,0.89990234375,0.89990234375,.00|游戏开始|9821,.00|游戏开始|9821
