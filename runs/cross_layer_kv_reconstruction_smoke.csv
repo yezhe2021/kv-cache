@@ -1,0 +1,4 @@
+sample_id,anchor_layers,method,context_tokens,cache_tokens,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,reference_continuation_ce,reconstructed_continuation_ce,reference_text,reconstructed_text
+0,"8,12,15",copy_nearest,128,127,8,0,0,0,0.0,0.0,0.89990234375,9.9765625,.00|游戏开始|9821,", b ar ping ping,itaritar"
+0,"8,12,15",interp,128,127,8,0,0,0,0.0,0.0,0.89990234375,8.203125,.00|游戏开始|9821,", the the the, of br,"
+0,"8,12,15",adapter,128,127,8,0,0,0,0.0,0.0,0.89990234375,5.296875,.00|游戏开始|9821, is the number is the number of the
