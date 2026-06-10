@@ -145,8 +145,8 @@ def main():
     parser.add_argument("--text_max_chars", type=int, default=20000)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--max_new_tokens", type=int, default=16)
-    parser.add_argument("--patch_layer_sets", default="8;12;8,12,15")
-    parser.add_argument("--suffix_starts", default="9,13")
+    parser.add_argument("--patch_layer_sets", default="none;8;12;8,12,15")
+    parser.add_argument("--suffix_starts", default="0,9,13")
     parser.add_argument("--alphas", default="1.0,0.5")
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--budget_ratio", type=float, default=0.5)
@@ -170,7 +170,12 @@ def main():
     features_s = collect_features(sender, texts, args.max_length, device)
     features_r = collect_features(receiver, texts, args.max_length, device)
     method = parse_method(args.method, args.slots_per_block)
-    patch_sets = [parse_int_list(chunk) for chunk in args.patch_layer_sets.split(";") if chunk.strip()]
+    patch_sets = []
+    for chunk in args.patch_layer_sets.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        patch_sets.append(None if chunk == "none" else parse_int_list(chunk))
     suffix_starts = parse_int_list(args.suffix_starts)
     alphas = [float(x) for x in args.alphas.split(",") if x.strip()]
     enc = receiver.tokenizer(texts, padding="max_length", truncation=True, max_length=args.max_length, return_tensors="pt")
@@ -179,38 +184,39 @@ def main():
     rows = []
 
     for patch_layers in patch_sets:
-        patch_key = ",".join(str(x) for x in patch_layers)
+        patch_key = "none" if patch_layers is None else ",".join(str(x) for x in patch_layers)
         per_layer = {}
-        for layer in patch_layers:
-            items = build_items(
-                features_s,
-                features_r,
-                layer,
-                args.block_size,
-                args.block_score_mode,
-                args.anchor_tokens,
-                args.budget_ratio,
-                method,
-                args.value_pool_mode,
-                device,
-            )
-            tk, tv, prep_input, denorm_pred = train_translators_return_models(
-                items,
-                method,
-                args.epochs,
-                args.lr,
-                args.hidden,
-                args.kv_loss_weight,
-                args.output_loss_weight,
-            )
-            per_layer[layer] = {
-                "items": items,
-                "tk": tk,
-                "tv": tv,
-                "prep_input": prep_input,
-                "denorm_pred": denorm_pred,
-                "attn_module": receiver.extractor.attn_layers[layer][1],
-            }
+        if patch_layers is not None:
+            for layer in patch_layers:
+                items = build_items(
+                    features_s,
+                    features_r,
+                    layer,
+                    args.block_size,
+                    args.block_score_mode,
+                    args.anchor_tokens,
+                    args.budget_ratio,
+                    method,
+                    args.value_pool_mode,
+                    device,
+                )
+                tk, tv, prep_input, denorm_pred = train_translators_return_models(
+                    items,
+                    method,
+                    args.epochs,
+                    args.lr,
+                    args.hidden,
+                    args.kv_loss_weight,
+                    args.output_loss_weight,
+                )
+                per_layer[layer] = {
+                    "items": items,
+                    "tk": tk,
+                    "tv": tv,
+                    "prep_input": prep_input,
+                    "denorm_pred": denorm_pred,
+                    "attn_module": receiver.extractor.attn_layers[layer][1],
+                }
 
         for sample_id in range(len(texts)):
             input_ids = input_ids_all[sample_id : sample_id + 1]
@@ -222,7 +228,8 @@ def main():
             ref_ids = ref[0].detach().cpu().tolist()
             ref_text = receiver.tokenizer.decode(ref_ids, skip_special_tokens=True)
             ref_ce = float(continuation_ce(receiver, ref, input_ids, attention_mask).cpu())
-            for alpha in alphas:
+            alpha_values = [0.0] if patch_layers is None else alphas
+            for alpha in alpha_values:
                 prefill = patched_prefill(receiver, input_ids, attention_mask, per_layer, sample_id, alpha, method)
                 for suffix_start in suffix_starts:
                     cache = suffix_cache(prefill.past_key_values, suffix_start, receiver.model)
