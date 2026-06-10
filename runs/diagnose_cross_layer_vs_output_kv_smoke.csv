@@ -1,0 +1,9 @@
+sample_id,variant,method,anchor_layers,context_tokens,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,reference_continuation_ce,variant_continuation_ce,reference_text,variant_text
+0,native_full,full,"8,12,15",128,8,1,1,8,1.0,1.0,0.9003846645355225,0.9003846645355225,.00|游戏开始|9821,.00|游戏开始|9821
+0,output_full,full,"8,12,15",128,8,1,1,8,1.0,1.0,0.9003846645355225,0.9003846645355225,.00|游戏开始|9821,.00|游戏开始|9821
+0,native_reconstructed,copy_nearest,"8,12,15",128,8,0,0,0,0.0,0.0,0.9003846645355225,9.976829528808594,.00|游戏开始|9821,", b ar ping ping,itaritar"
+0,output_reconstructed,copy_nearest,"8,12,15",128,8,0,0,0,0.0,0.0,0.9003846645355225,8.999835968017578,.00|游戏开始|9821,", b ping ping,itaritaritar"
+0,native_reconstructed,interp,"8,12,15",128,8,0,0,0,0.0,0.0,0.9003846645355225,8.200221061706543,.00|游戏开始|9821,", the the the, of br,"
+0,output_reconstructed,interp,"8,12,15",128,8,0,0,0,0.0,0.0,0.9003846645355225,9.576087951660156,.00|游戏开始|9821,", i of í án, are,"
+0,native_reconstructed,adapter,"8,12,15",128,8,0,0,0,0.125,0.125,0.9003846645355225,4.722499847412109,.00|游戏开始|9821,-1/2/100/100
+0,output_reconstructed,adapter,"8,12,15",128,8,0,0,0,0.0,0.0,0.9003846645355225,9.709080696105957,.00|游戏开始|9821,"\.\.\.\.[""].30\."
