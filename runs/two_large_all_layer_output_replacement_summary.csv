@@ -1,0 +1,5 @@
+model,layers,patch_source,alpha,n,first_token_match,exact_match,token_f1,sequence_similarity
+qwen17,28,none,0.0,2,1.0,1.0,1.0,1.0
+qwen17,28,translated,1.0,2,0.0,0.0,0.0,0.0
+gemma2b,26,none,0.0,2,1.0,1.0,1.0,1.0
+gemma2b,26,translated,1.0,2,0.0,0.0,0.5,0.5
