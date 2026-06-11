@@ -1,0 +1,4 @@
+sample_id,layers,patch_source,alpha,context_tokens,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,boot_continuation_ce,full_text,boot_text
+0,"0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",none,0.0,64,4,1,1,4,1.0,1.0,0.023076537996530533,0.023076537996530533,00|游戏开始,00|游戏开始
+0,"0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",translated,1.0,64,4,0,0,0,0.25,0.25,0.023076537996530533,10.516439437866211,00|游戏开始,|||
+0,"0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",translated,0.5,64,4,1,1,4,1.0,1.0,0.023076537996530533,0.023076537996530533,00|游戏开始,00|游戏开始
