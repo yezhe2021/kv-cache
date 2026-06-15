@@ -1,0 +1,7 @@
+num_train,num_eval,suffix_start,layers,patch_source,alpha,n,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity
+8,8,8,"8,9,10,11,12,13,14,15",none,0.0,8,1.0,1.0,8.0,1.0,1.0
+8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,8,0.75,0.0,4.5,0.6875,0.65625
+8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,8,1.0,0.25,6.5,0.8125,0.8125
+8,8,12,"12,13,14,15",none,0.0,8,1.0,1.0,8.0,1.0,1.0
+8,8,12,"12,13,14,15",translated,1.0,8,1.0,0.75,6.75,0.90625,0.90625
+8,8,12,"12,13,14,15",translated,0.5,8,1.0,1.0,8.0,1.0,1.0
