@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+from glob import glob
 from pathlib import Path
 
 import torch
@@ -17,7 +18,7 @@ from attention_output_bootstrap_generation_experiment import (
     token_f1,
 )
 from block_memory_method_sweep import build_items, parse_method
-from evidence_recall_selective_recompute import collect_features, load_bundle, load_text_files
+from evidence_recall_selective_recompute import collect_features, load_bundle
 from generation_effect_experiment import train_translators_return_models
 
 
@@ -34,12 +35,86 @@ def mean(rows, field):
     return sum(float(row[field]) for row in rows) / max(len(rows), 1)
 
 
+def record_to_text(record):
+    if isinstance(record, dict):
+        if {"context", "question"}.issubset(record):
+            answer = record.get("answer", "")
+            return f"Context:\n{record['context']}\n\nQuestion: {record['question']}\nAnswer: {answer}".strip()
+        if "conversations" in record:
+            parts = []
+            for turn in record["conversations"]:
+                speaker = turn.get("from", "speaker")
+                value = turn.get("value", "")
+                parts.append(f"{speaker}: {value}")
+            return "\n".join(parts).strip()
+        if "data" in record:
+            texts = []
+            for item in record["data"]:
+                for paragraph in item.get("paragraphs", []):
+                    context = paragraph.get("context", "")
+                    for qa in paragraph.get("qas", []):
+                        texts.append(f"Context:\n{context}\n\nQuestion: {qa.get('question', '')}".strip())
+            return texts
+    return str(record).strip()
+
+
+def load_dataset_texts(path_or_glob, limit, max_chars):
+    paths = sorted(glob(path_or_glob, recursive=True))
+    if not paths:
+        path = Path(path_or_glob)
+        if path.is_dir():
+            paths = sorted(str(p) for p in path.rglob("*") if p.is_file() and p.suffix.lower() in {".txt", ".json", ".jsonl"})
+        elif path.exists():
+            paths = [str(path)]
+    if not paths:
+        raise FileNotFoundError(f"No dataset files matched: {path_or_glob}")
+
+    texts = []
+    for file_name in paths:
+        path = Path(file_name)
+        suffix = path.suffix.lower()
+        if suffix == ".txt":
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                texts.append(text[:max_chars])
+        elif suffix == ".jsonl":
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    text = record_to_text(json.loads(line))
+                    if isinstance(text, list):
+                        texts.extend(x[:max_chars] for x in text if x)
+                    elif text:
+                        texts.append(text[:max_chars])
+                    if len(texts) >= limit:
+                        break
+        elif suffix == ".json":
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, list):
+                records = data
+            else:
+                converted = record_to_text(data)
+                records = converted if isinstance(converted, list) else [converted]
+            for record in records:
+                text = record_to_text(record) if not isinstance(record, str) else record
+                if text:
+                    texts.append(text[:max_chars])
+                if len(texts) >= limit:
+                    break
+        if len(texts) >= limit:
+            break
+    if len(texts) < limit:
+        raise ValueError(f"Need {limit} texts, loaded {len(texts)} from {path_or_glob}")
+    return texts[:limit]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sender_model", default="/home/yezhe/all_models/hub/models/Qwen/Qwen3-0___6B")
     parser.add_argument("--receiver_model", default="/home/yezhe/all_models/models/LLM-Research/Llama-3___2-1B-Instruct")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--text_glob", default="/home/yezhe/demo/train/**/*.txt")
+    parser.add_argument("--dataset_path", default="/home/yezhe/数据集/HotpotQA/processed/hotpot_train_context_qa.jsonl")
     parser.add_argument("--num_train", type=int, default=8)
     parser.add_argument("--num_eval", type=int, default=8)
     parser.add_argument("--text_max_chars", type=int, default=20000)
@@ -64,9 +139,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
-    texts = load_text_files(args.text_glob, args.num_train + args.num_eval, args.text_max_chars)
-    if len(texts) < args.num_train + args.num_eval:
-        raise ValueError(f"Need {args.num_train + args.num_eval} texts, found {len(texts)}")
+    texts = load_dataset_texts(args.dataset_path, args.num_train + args.num_eval, args.text_max_chars)
     train_texts = texts[: args.num_train]
     eval_texts = texts[args.num_train : args.num_train + args.num_eval]
 

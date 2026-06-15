@@ -1,0 +1,49 @@
+sample_id,split,num_train,num_eval,suffix_start,layers,patch_source,alpha,context_tokens,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,full_continuation_ce,boot_continuation_ce,full_text,boot_text
+0,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,0.91042160987854,0.91042160987854," 25 February 2011, with"," 25 February 2011, with"
+0,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,1,0,1,0.375,0.375,0.91042160987854,1.9727809429168701," 25 February 2011, with", 2011. The show was a
+0,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,1,0,1,0.5,0.5,0.91042160987854,1.0118629932403564," 25 February 2011, with", 31 December 2011.\n\nThe
+1,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.538665771484375,1.538665771484375,Problem Statement]\nThe circuit is currently being,Problem Statement]\nThe circuit is currently being
+1,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,0,0,0,0.25,0.25,1.538665771484375,1.5778014659881592,Problem Statement]\nThe circuit is currently being,The 6.213 km track is
+1,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,0,0,0,0.25,0.25,1.538665771484375,1.73599112033844,Problem Statement]\nThe circuit is currently being,The track is also known for its challenging
+2,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,0.9281244874000549,0.9281244874000549,"-Patrick), is an American rapper","-Patrick), is an American rapper"
+2,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,0,0,0,0.125,0.125,0.9281244874000549,2.3362226486206055,"-Patrick), is an American rapper",. P. O. P.) is
+2,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,1,0,1,0.75,0.75,0.9281244874000549,0.894946277141571,"-Patrick), is an American rapper","-Personal), is an American rapper"
+3,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.1764906644821167,1.1764906644821167," film ""The Great Dictator"", which"," film ""The Great Dictator"", which"
+3,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,0,0,0,0.25,0.25,1.1764906644821167,1.8593344688415527," film ""The Great Dictator"", which","-1932 series ""The Adventures of"
+3,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,1,1,8,1.0,1.0,1.1764906644821167,1.1764906644821167," film ""The Great Dictator"", which"," film ""The Great Dictator"", which"
+4,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,0.839825451374054,0.839825451374054," the way, he encounters various obstacles and"," the way, he encounters various obstacles and"
+4,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,0,0,0,0.25,0.25,0.839825451374054,1.022316813468933," the way, he encounters various obstacles and"," with the story, the kacapi"
+4,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,0,0,0,0.25,0.25,0.839825451374054,1.2018200159072876," the way, he encounters various obstacles and"," with the story, the performance also includes"
+5,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.1773594617843628,1.1773594617843628, of the fact that the lake is a, of the fact that the lake is a
+5,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,1,0,6,0.75,0.75,1.1773594617843628,1.1880874633789062, of the fact that the lake is a, of the fact that the lake was not
+5,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,1,0,7,0.875,0.875,1.1773594617843628,1.1991773843765259, of the fact that the lake is a, of the fact that the lake is situated
+6,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.2432191371917725,1.2432191371917725, sculpture by artist [Artist Name] that, sculpture by artist [Artist Name] that
+6,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,0,0,0,0.125,0.125,1.2432191371917725,2.2339329719543457, sculpture by artist [Artist Name] that,. The sculpture is a 40-foot
+6,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,1,1,8,1.0,1.0,1.2432191371917725,1.2432191371917725, sculpture by artist [Artist Name] that, sculpture by artist [Artist Name] that
+7,eval,8,8,8,"8,9,10,11,12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.2466373443603516,1.2466373443603516,"ial debut with the film ""The Des","ial debut with the film ""The Des"
+7,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,1.0,128,8,1,0,4,0.625,0.625,1.2466373443603516,0.825006365776062,"ial debut with the film ""The Des",ial debut with the 2007 film
+7,eval,8,8,8,"8,9,10,11,12,13,14,15",translated,0.5,128,8,1,0,4,0.625,0.625,1.2466373443603516,0.825006365776062,"ial debut with the film ""The Des",ial debut with the 2007 film
+0,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,0.91042160987854,0.91042160987854," 25 February 2011, with"," 25 February 2011, with"
+0,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,1,0,6,0.75,0.75,0.91042160987854,0.9609912037849426," 25 February 2011, with", 25 February 2011.\n\nThe
+0,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,0,6,0.75,0.75,0.91042160987854,0.9609912037849426," 25 February 2011, with", 25 February 2011.\n\nThe
+1,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.538665771484375,1.538665771484375,Problem Statement]\nThe circuit is currently being,Problem Statement]\nThe circuit is currently being
+1,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,0,0,0,0.25,0.25,1.538665771484375,1.565047025680542,Problem Statement]\nThe circuit is currently being,The track's layout] The track is
+1,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,0,0,0,0.125,0.125,1.538665771484375,1.5534043312072754,Problem Statement]\nThe circuit is currently being,The track's layout] The track's
+2,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,0.9281244874000549,0.9281244874000549,"-Patrick), is an American rapper","-Patrick), is an American rapper"
+2,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,0,0,0,0.125,0.125,0.9281244874000549,2.124323844909668,"-Patrick), is an American rapper",". P. O. P.), is"
+2,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,0,1,0.75,0.75,0.9281244874000549,0.952888011932373,"-Patrick), is an American rapper","-Peter), is an American rapper,"
+3,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.1764906644821167,1.1764906644821167," film ""The Great Dictator"", which"," film ""The Great Dictator"", which"
+3,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,1,1,8,1.0,1.0,1.1764906644821167,1.1764906644821167," film ""The Great Dictator"", which"," film ""The Great Dictator"", which"
+3,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,1,8,1.0,1.0,1.1764906644821167,1.1764906644821167," film ""The Great Dictator"", which"," film ""The Great Dictator"", which"
+4,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,0.839825451374054,0.839825451374054," the way, he encounters various obstacles and"," the way, he encounters various obstacles and"
+4,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,1,1,8,1.0,1.0,0.839825451374054,0.839825451374054," the way, he encounters various obstacles and"," the way, he encounters various obstacles and"
+4,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,1,8,1.0,1.0,0.839825451374054,0.839825451374054," the way, he encounters various obstacles and"," the way, he encounters various obstacles and"
+5,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.1773594617843628,1.1773594617843628, of the fact that the lake is a, of the fact that the lake is a
+5,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,1,0,5,0.75,0.75,1.1773594617843628,1.21412992477417, of the fact that the lake is a, of the fact that the island is named
+5,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,0,5,0.75,0.75,1.1773594617843628,1.21412992477417, of the fact that the lake is a, of the fact that the island is named
+6,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.2432191371917725,1.2432191371917725, sculpture by artist [Artist Name] that, sculpture by artist [Artist Name] that
+6,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,0,0,0,0.875,0.875,1.2432191371917725,2.2954277992248535, sculpture by artist [Artist Name] that,0 sculpture by artist [Artist Name]
+6,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,1,8,1.0,1.0,1.2432191371917725,1.2432191371917725, sculpture by artist [Artist Name] that, sculpture by artist [Artist Name] that
+7,eval,8,8,12,"12,13,14,15",none,0.0,128,8,1,1,8,1.0,1.0,1.2466373443603516,1.2466373443603516,"ial debut with the film ""The Des","ial debut with the film ""The Des"
+7,eval,8,8,12,"12,13,14,15",translated,1.0,128,8,1,0,4,0.625,0.625,1.2466373443603516,0.825006365776062,"ial debut with the film ""The Des",ial debut with the 2007 film
+7,eval,8,8,12,"12,13,14,15",translated,0.5,128,8,1,0,4,0.625,0.625,1.2466373443603516,0.825006365776062,"ial debut with the film ""The Des",ial debut with the 2007 film
