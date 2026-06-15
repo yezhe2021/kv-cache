@@ -1,4 +1,9 @@
-"""Suffix output patch experiment with an explicit train/eval text split."""
+"""Suffix output patch experiment with an explicit train/eval text split.
+
+Early receiver layers run normal prefill. Later suffix layers replace their
+attention output with sender-guided translated output, then the receiver keeps
+forwarding and uses the resulting native KV cache for greedy decoding.
+"""
 
 import argparse
 import csv
@@ -36,10 +41,13 @@ def mean(rows, field):
 
 
 def record_to_text(record):
+    """Normalize supported dataset records into plain prompt text."""
     if isinstance(record, dict):
+        # HotpotQA processed jsonl: long context plus question/answer fields.
         if {"context", "question"}.issubset(record):
             answer = record.get("answer", "")
             return f"Context:\n{record['context']}\n\nQuestion: {record['question']}\nAnswer: {answer}".strip()
+        # OpenHermes style json: multi-turn conversation records.
         if "conversations" in record:
             parts = []
             for turn in record["conversations"]:
@@ -47,6 +55,7 @@ def record_to_text(record):
                 value = turn.get("value", "")
                 parts.append(f"{speaker}: {value}")
             return "\n".join(parts).strip()
+        # SQuAD style json: nested data/paragraphs/qas records.
         if "data" in record:
             texts = []
             for item in record["data"]:
@@ -59,6 +68,7 @@ def record_to_text(record):
 
 
 def load_dataset_texts(path_or_glob, limit, max_chars):
+    """Load txt/json/jsonl samples from the configured dataset path."""
     paths = sorted(glob(path_or_glob, recursive=True))
     if not paths:
         path = Path(path_or_glob)
@@ -73,10 +83,12 @@ def load_dataset_texts(path_or_glob, limit, max_chars):
     for file_name in paths:
         path = Path(file_name)
         suffix = path.suffix.lower()
+        # Plain text files are consumed as one sample per file.
         if suffix == ".txt":
             text = path.read_text(encoding="utf-8", errors="replace").strip()
             if text:
                 texts.append(text[:max_chars])
+        # Jsonl datasets are consumed line by line, which gives stable splits.
         elif suffix == ".jsonl":
             with path.open(encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -89,6 +101,7 @@ def load_dataset_texts(path_or_glob, limit, max_chars):
                         texts.append(text[:max_chars])
                     if len(texts) >= limit:
                         break
+        # Json datasets may be either a list of records or a nested QA object.
         elif suffix == ".json":
             data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
             if isinstance(data, list):
@@ -139,6 +152,9 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+
+    # The translator is fitted only on train_texts. All generation metrics below
+    # are computed on eval_texts, so train/eval leakage is avoided.
     texts = load_dataset_texts(args.dataset_path, args.num_train + args.num_eval, args.text_max_chars)
     train_texts = texts[: args.num_train]
     eval_texts = texts[args.num_train : args.num_train + args.num_eval]
@@ -150,6 +166,9 @@ def main():
     suffix_starts = parse_ints(args.suffix_starts)
     alphas = [float(x.strip()) for x in args.alphas.split(",") if x.strip()]
 
+    # Collect sender/receiver QKV features separately for train and eval.
+    # Train features fit the K/V -> receiver-output translators; eval features
+    # provide held-out translated outputs for patched receiver prefill.
     train_s = collect_features(sender, train_texts, args.max_length, device)
     train_r = collect_features(receiver, train_texts, args.max_length, device)
     eval_s = collect_features(sender, eval_texts, args.max_length, device)
@@ -169,10 +188,15 @@ def main():
     for suffix_start in suffix_starts:
         if not 0 <= suffix_start < layer_count:
             raise ValueError(f"suffix_start {suffix_start} outside receiver layer range 0..{layer_count - 1}")
+
+        # Prefix layers [0, suffix_start) run normally. Only layers in this
+        # suffix are patched with translated attention outputs during prefill.
         layers = list(range(suffix_start, layer_count))
         layer_key = ",".join(str(x) for x in layers)
         per_layer = {}
         for layer in layers:
+            # Build matching train/eval examples for this layer. The fitted
+            # translator modules are reused with eval_items in patched_prefill.
             train_items = build_items(
                 train_s,
                 train_r,
@@ -221,12 +245,16 @@ def main():
             context_len = int(attention_mask.sum().item())
             input_ids = input_ids[:, :context_len]
             attention_mask = attention_mask[:, :context_len]
+
+            # Reference path: normal receiver full prefill and greedy decode.
             full_new = greedy_full_receiver(receiver, input_ids, attention_mask, args.max_new_tokens)
             full_ids = full_new[0].detach().cpu().tolist()
             full_text = receiver.tokenizer.decode(full_ids, skip_special_tokens=True)
             for patch_source in ["none", "translated"]:
                 alpha_values = [0.0] if patch_source == "none" else alphas
                 for alpha in alpha_values:
+                    # Patched path: suffix attention outputs are replaced during
+                    # prefill; the resulting native KV cache drives decoding.
                     prefill_out = patched_prefill(receiver, input_ids, attention_mask, per_layer, sample_id, patch_source, alpha, method)
                     boot_new = greedy_from_prefill(receiver, prefill_out, context_len, args.max_new_tokens)
                     boot_ids = boot_new[0].detach().cpu().tolist()
@@ -286,6 +314,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
+    # Compact summary by suffix boundary, patch source, and interpolation alpha.
     grouped = {}
     for row in rows:
         key = (row["suffix_start"], row["layers"], row["patch_source"], row["alpha"])
