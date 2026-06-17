@@ -69,6 +69,20 @@ def load_hotpot_records(path, limit):
     return records
 
 
+def select_records_by_full_length(records, tokenizer, max_tokens, need):
+    if max_tokens <= 0:
+        return records[:need]
+    selected = []
+    for record in records:
+        if token_count(tokenizer, format_hotpot_prompt(record)) <= max_tokens:
+            selected.append(record)
+            if len(selected) >= need:
+                break
+    if len(selected) < need:
+        raise ValueError(f"Need {need} records with <= {max_tokens} tokens, selected {len(selected)}.")
+    return selected
+
+
 def encode_prompt(tokenizer, text, max_length, device):
     enc = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
     return enc["input_ids"].to(device), enc["attention_mask"].to(device)
@@ -188,7 +202,9 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_train", type=int, default=4)
     parser.add_argument("--num_eval", type=int, default=8)
-    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--record_scan_limit", type=int, default=512)
+    parser.add_argument("--max_full_tokens_for_records", type=int, default=0)
+    parser.add_argument("--max_length", type=int, default=1536)
     parser.add_argument("--query_max_length", type=int, default=96)
     parser.add_argument("--max_new_tokens", type=int, default=48)
     parser.add_argument("--max_memory_slots", type=int, default=96)
@@ -209,16 +225,19 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
-    records = load_hotpot_records(args.dataset_path, args.num_train + args.num_eval)
+    sender = load_bundle("sender", args.sender_model, device)
+    receiver = load_bundle("receiver", args.receiver_model, device)
+    method = parse_method(args.method, args.slots_per_block)
+
+    need_records = args.num_train + args.num_eval
+    scan_limit = max(args.record_scan_limit, need_records)
+    records = load_hotpot_records(args.dataset_path, scan_limit)
+    records = select_records_by_full_length(records, receiver.tokenizer, args.max_full_tokens_for_records, need_records)
     train_records = records[: args.num_train]
     eval_records = records[args.num_train : args.num_train + args.num_eval]
     train_full = [format_hotpot_prompt(r) for r in train_records]
     eval_full = [format_hotpot_prompt(r) for r in eval_records]
     eval_query = [format_hotpot_query(r) for r in eval_records]
-
-    sender = load_bundle("sender", args.sender_model, device)
-    receiver = load_bundle("receiver", args.receiver_model, device)
-    method = parse_method(args.method, args.slots_per_block)
 
     train_s = collect_features(sender, train_full, args.max_length, device)
     train_r = collect_features(receiver, train_full, args.max_length, device)

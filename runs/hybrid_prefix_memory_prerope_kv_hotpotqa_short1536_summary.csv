@@ -1,0 +1,3 @@
+variant,n,n_full_correct,full_baseline_answer_rate,full_context_truncation_rate,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,answer_contains,answer_contains_when_full_correct
+query_only,4,2,0.5,0.0,0.25,0.0,2.0,0.315368473467065,0.315368473467065,0.25,0.5
+query_plus_sender_memory_conditioned_prerope,4,2,0.5,0.0,0.25,0.0,2.0,0.19042002917899806,0.19042002917899806,0.25,0.5
