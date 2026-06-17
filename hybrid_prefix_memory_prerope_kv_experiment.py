@@ -149,6 +149,32 @@ def build_memory_prefix_cache(per_layer, sample_id, receiver_model, max_memory_s
 
 
 @torch.no_grad()
+def build_native_selected_memory_prefix_cache(per_layer, sample_id, receiver_model, max_memory_slots):
+    q_heads, kv_heads = infer_kv_heads(receiver_model)
+    cache_data = []
+    memory_len = None
+
+    for layer in range(receiver_model.config.num_hidden_layers):
+        item = per_layer[layer]["items"][sample_id]
+        k_pre, v = compact_valid_slots(item["target_k_slots"], item["target_v_slots"], item["valid_slots"])
+        if max_memory_slots > 0:
+            k_pre = k_pre[:, :, :max_memory_slots, :]
+            v = v[:, :, :max_memory_slots, :]
+        if memory_len is None:
+            memory_len = k_pre.shape[2]
+        else:
+            k_pre = k_pre[:, :, :memory_len, :]
+            v = v[:, :, :memory_len, :]
+        positions = torch.arange(k_pre.shape[2], device=k_pre.device)
+        k = apply_receiver_rope(receiver_model, k_pre, positions)
+        k = q_heads_to_kv_heads(k, q_heads, kv_heads).to(receiver_model.dtype).contiguous()
+        v = q_heads_to_kv_heads(v, q_heads, kv_heads).to(receiver_model.dtype).contiguous()
+        cache_data.append((k, v))
+
+    return DynamicCache(ddp_cache_data=cache_data, config=receiver_model.config), int(memory_len or 0)
+
+
+@torch.no_grad()
 def prefill_query_with_memory_cache(receiver, query_ids, memory_cache, memory_len):
     device = query_ids.device
     query_len = query_ids.shape[1]
@@ -192,6 +218,37 @@ def greedy_from_conditioned_prefill(receiver, prefill_out, memory_len, query_len
 
 def answer_contains(text, answer):
     return int(answer.strip().lower() in text.strip().lower())
+
+
+def selected_answer_recall(record, full_prompt, item, max_memory_slots):
+    answer = str(record.get("answer", "")).strip().lower()
+    text = full_prompt.lower()
+    if not answer or answer not in text:
+        return 0
+    valid = item["valid_slots"]
+    slot_starts = item["slot_starts"]
+    chosen = torch.nonzero(valid, as_tuple=False).flatten()
+    if max_memory_slots > 0:
+        chosen = chosen[:max_memory_slots]
+    if chosen.numel() == 0:
+        return 0
+    block_ids = sorted({int(slot_starts[i].item()) for i in chosen})
+    # block_id is represented by its token start. Decode-free approximation:
+    # if any selected block token span maps back to text containing the answer.
+    offsets = item.get("r_offsets")
+    if offsets is None:
+        return 0
+    for start in block_ids:
+        end = min(start + int(item.get("block_size", 32)), offsets.shape[1])
+        char_spans = offsets[0, start:end]
+        valid_spans = char_spans[char_spans[:, 1] > char_spans[:, 0]]
+        if valid_spans.numel() == 0:
+            continue
+        char_start = int(valid_spans[:, 0].min().item())
+        char_end = int(valid_spans[:, 1].max().item())
+        if answer in text[char_start:char_end]:
+            return 1
+    return 0
 
 
 def main():
@@ -276,6 +333,9 @@ def main():
             device,
             "pre_rope",
         )
+        for item, feature_row in zip(eval_items, eval_r):
+            item["r_offsets"] = feature_row["offsets"].to(device)
+            item["block_size"] = args.block_size
         tk, tv, prep_input, denorm_pred = train_translators_return_models(
             train_items,
             method,
@@ -300,14 +360,19 @@ def main():
         memory_cache, memory_len = build_memory_prefix_cache(per_layer, sample_id, receiver.model, args.max_memory_slots)
         hybrid_prefill = prefill_query_with_memory_cache(receiver, query_ids, memory_cache, memory_len)
         hybrid_new = greedy_from_conditioned_prefill(receiver, hybrid_prefill, memory_len, query_ids.shape[1], args.max_new_tokens)
+        native_cache, native_memory_len = build_native_selected_memory_prefix_cache(per_layer, sample_id, receiver.model, args.max_memory_slots)
+        native_prefill = prefill_query_with_memory_cache(receiver, query_ids, native_cache, native_memory_len)
+        native_new = greedy_from_conditioned_prefill(receiver, native_prefill, native_memory_len, query_ids.shape[1], args.max_new_tokens)
 
         full_ids_list = full_new[0].detach().cpu().tolist()
         full_text = receiver.tokenizer.decode(full_ids_list, skip_special_tokens=True)
         full_answer_contains = answer_contains(full_text, record.get("answer", ""))
         full_context_truncated = int(full_untruncated_tokens > args.max_length)
         query_truncated = int(query_untruncated_tokens > args.query_max_length)
+        answer_recall = selected_answer_recall(record, eval_full[sample_id], per_layer[0]["items"][sample_id], args.max_memory_slots)
         variants = {
             "query_only": query_new,
+            "native_receiver_selected_memory_prefix": native_new,
             "query_plus_sender_memory_conditioned_prerope": hybrid_new,
         }
         for name, pred in variants.items():
@@ -317,6 +382,8 @@ def main():
                 "sample_id": sample_id,
                 "variant": name,
                 "memory_slots": memory_len,
+                "native_memory_slots": native_memory_len,
+                "selected_answer_recall": answer_recall,
                 "query_tokens": int(query_mask.sum().item()),
                 "full_tokens": int(full_mask.sum().item()),
                 "full_untruncated_tokens": full_untruncated_tokens,
@@ -350,6 +417,8 @@ def main():
         "sample_id",
         "variant",
         "memory_slots",
+        "native_memory_slots",
+        "selected_answer_recall",
         "query_tokens",
         "full_tokens",
         "full_untruncated_tokens",
@@ -389,6 +458,7 @@ def main():
                 "n_full_correct": len(full_correct),
                 "full_baseline_answer_rate": sum(float(x["full_answer_contains"]) for x in vals) / len(vals),
                 "full_context_truncation_rate": sum(float(x["full_context_truncated"]) for x in vals) / len(vals),
+                "selected_answer_recall": sum(float(x["selected_answer_recall"]) for x in vals) / len(vals),
                 "first_token_match": sum(float(x["first_token_match"]) for x in vals) / len(vals),
                 "exact_match": sum(float(x["exact_match"]) for x in vals) / len(vals),
                 "prefix_match_tokens": sum(float(x["prefix_match_tokens"]) for x in vals) / len(vals),
@@ -409,6 +479,7 @@ def main():
             "n_full_correct",
             "full_baseline_answer_rate",
             "full_context_truncation_rate",
+            "selected_answer_recall",
             "first_token_match",
             "exact_match",
             "prefix_match_tokens",
