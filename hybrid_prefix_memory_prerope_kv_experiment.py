@@ -1,0 +1,368 @@
+"""Hybrid prefix-memory pre-RoPE KV experiment.
+
+Sender selected memory blocks are translated as receiver pre-RoPE content KV.
+Receiver keeps its own short query KV. The final cache layout is:
+
+    [translated sender memory prefix][receiver query prefix]
+
+K position is applied only on the receiver side:
+
+    memory positions: 0..M-1
+    query positions:  M..M+Q-1
+    decode positions: M+Q...
+"""
+
+import argparse
+import csv
+import json
+import os
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from transformers.cache_utils import DynamicCache
+
+from block_memory_method_sweep import parse_method
+from evidence_recall_selective_recompute import collect_features, load_bundle
+from generation_effect_experiment import train_translators_return_models
+from kv_cache_sharing_generation_experiment import (
+    build_cache_space_items,
+    greedy_full_receiver,
+    infer_kv_heads,
+    q_heads_to_kv_heads,
+    seq_similarity,
+    token_f1,
+    translated_slots,
+)
+from run_suffix_output_patch_prefill_split_experiment import load_dataset_texts
+
+
+def format_hotpot_prompt(record):
+    return f"Context:\n{record['context']}\n\nQuestion: {record['question']}\nAnswer:"
+
+
+def format_hotpot_query(record):
+    return f"Question: {record['question']}\nAnswer:"
+
+
+def load_hotpot_records(path, limit):
+    records = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if {"context", "question"}.issubset(row):
+                records.append(row)
+            if len(records) >= limit:
+                break
+    if len(records) < limit:
+        raise ValueError(f"Need {limit} HotpotQA records, loaded {len(records)} from {path}")
+    return records
+
+
+def encode_prompt(tokenizer, text, max_length, device):
+    enc = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+    return enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+
+def continuation_ce(receiver, generated_ids, input_ids, attention_mask):
+    full = torch.cat([input_ids, generated_ids], dim=1)
+    full_mask = torch.cat([attention_mask, torch.ones_like(generated_ids)], dim=1)
+    logits = receiver.model(input_ids=full, attention_mask=full_mask, use_cache=False).logits
+    start = input_ids.shape[1] - 1
+    end = full.shape[1] - 1
+    pred = logits[:, start:end, :].contiguous()
+    labels = generated_ids.contiguous()
+    return F.cross_entropy(pred.view(-1, pred.shape[-1]), labels.view(-1), reduction="mean")
+
+
+def apply_receiver_rope(receiver_model, k_pre, positions):
+    dummy = torch.zeros((k_pre.shape[0], positions.numel(), receiver_model.config.hidden_size), device=k_pre.device, dtype=k_pre.dtype)
+    pos = positions[None, :].to(k_pre.device)
+    cos, sin = receiver_model.model.rotary_emb(dummy, pos)
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    _, k_rot = apply_rotary_pos_emb(k_pre, k_pre, cos, sin)
+    return k_rot
+
+
+def compact_valid_slots(k, v, valid_slots):
+    idx = torch.nonzero(valid_slots, as_tuple=False).flatten()
+    if idx.numel() == 0:
+        idx = torch.arange(k.shape[2], device=k.device)
+    return k[:, :, idx, :], v[:, :, idx, :]
+
+
+@torch.no_grad()
+def build_memory_prefix_cache(per_layer, sample_id, receiver_model, max_memory_slots):
+    q_heads, kv_heads = infer_kv_heads(receiver_model)
+    cache_data = []
+    memory_len = None
+
+    for layer in range(receiver_model.config.num_hidden_layers):
+        data = per_layer[layer]
+        item = data["items"][sample_id]
+        k_pre, v = translated_slots(item, data["tk"], data["tv"], data["prep_input"], data["denorm_pred"])
+        k_pre, v = compact_valid_slots(k_pre, v, item["valid_slots"])
+        if max_memory_slots > 0:
+            k_pre = k_pre[:, :, :max_memory_slots, :]
+            v = v[:, :, :max_memory_slots, :]
+        if memory_len is None:
+            memory_len = k_pre.shape[2]
+        else:
+            k_pre = k_pre[:, :, :memory_len, :]
+            v = v[:, :, :memory_len, :]
+        positions = torch.arange(k_pre.shape[2], device=k_pre.device)
+        k = apply_receiver_rope(receiver_model, k_pre, positions)
+        k = q_heads_to_kv_heads(k, q_heads, kv_heads).to(receiver_model.dtype).contiguous()
+        v = q_heads_to_kv_heads(v, q_heads, kv_heads).to(receiver_model.dtype).contiguous()
+        cache_data.append((k, v))
+
+    return DynamicCache(ddp_cache_data=cache_data, config=receiver_model.config), int(memory_len or 0)
+
+
+@torch.no_grad()
+def build_query_prefix_cache(receiver, query_ids, query_mask, memory_len):
+    prefix_ids = query_ids[:, :-1]
+    prefix_mask = query_mask[:, :-1]
+    if prefix_ids.shape[1] == 0:
+        return None
+    position_ids = torch.arange(memory_len, memory_len + prefix_ids.shape[1], device=query_ids.device).unsqueeze(0)
+    out = receiver.model(
+        input_ids=prefix_ids,
+        attention_mask=prefix_mask,
+        position_ids=position_ids,
+        use_cache=True,
+    )
+    return out.past_key_values
+
+
+def concat_caches(memory_cache, query_cache, receiver_model):
+    if query_cache is None:
+        return memory_cache
+    cache_data = []
+    for mem_layer, query_layer in zip(memory_cache.layers, query_cache.layers):
+        k = torch.cat([mem_layer.keys, query_layer.keys], dim=2).to(receiver_model.dtype).contiguous()
+        v = torch.cat([mem_layer.values, query_layer.values], dim=2).to(receiver_model.dtype).contiguous()
+        cache_data.append((k, v))
+    return DynamicCache(ddp_cache_data=cache_data, config=receiver_model.config)
+
+
+@torch.no_grad()
+def greedy_with_hybrid_cache(receiver, query_ids, cache, memory_len, max_new_tokens):
+    generated = []
+    cur = query_ids[:, -1:]
+    device = query_ids.device
+    query_len = query_ids.shape[1]
+
+    for step in range(max_new_tokens):
+        cache_len = cache.get_seq_length()
+        attention_mask = torch.ones((1, cache_len + 1), dtype=torch.long, device=device)
+        position_ids = torch.tensor([[memory_len + query_len - 1 + step]], dtype=torch.long, device=device)
+        out = receiver.model(
+            input_ids=cur,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+        )
+        next_id = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+        generated.append(next_id)
+        cur = next_id
+        cache = out.past_key_values
+    return torch.cat(generated, dim=1)
+
+
+def answer_contains(text, answer):
+    return int(answer.strip().lower() in text.strip().lower())
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sender_model", default="/home/yezhe/all_models/hub/models/Qwen/Qwen3-0___6B")
+    parser.add_argument("--receiver_model", default="/home/yezhe/all_models/models/LLM-Research/Llama-3___2-1B-Instruct")
+    parser.add_argument("--dataset_path", default="/home/yezhe/数据集/HotpotQA/processed/hotpot_train_context_qa.jsonl")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--num_train", type=int, default=4)
+    parser.add_argument("--num_eval", type=int, default=4)
+    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--query_max_length", type=int, default=96)
+    parser.add_argument("--max_new_tokens", type=int, default=12)
+    parser.add_argument("--max_memory_slots", type=int, default=64)
+    parser.add_argument("--block_size", type=int, default=32)
+    parser.add_argument("--budget_ratio", type=float, default=0.5)
+    parser.add_argument("--block_score_mode", default="anchor_count")
+    parser.add_argument("--anchor_tokens", type=int, default=64)
+    parser.add_argument("--slots_per_block", type=int, default=4)
+    parser.add_argument("--method", default="multislot_headwise_norm")
+    parser.add_argument("--value_pool_mode", default="uniform")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--kv_loss_weight", type=float, default=0.1)
+    parser.add_argument("--output_loss_weight", type=float, default=1.0)
+    parser.add_argument("--csv", default="runs/hybrid_prefix_memory_prerope_kv_hotpotqa.csv")
+    parser.add_argument("--summary_csv", default="runs/hybrid_prefix_memory_prerope_kv_hotpotqa_summary.csv")
+    args = parser.parse_args()
+
+    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    records = load_hotpot_records(args.dataset_path, args.num_train + args.num_eval)
+    train_records = records[: args.num_train]
+    eval_records = records[args.num_train : args.num_train + args.num_eval]
+    train_full = [format_hotpot_prompt(r) for r in train_records]
+    eval_full = [format_hotpot_prompt(r) for r in eval_records]
+    eval_query = [format_hotpot_query(r) for r in eval_records]
+
+    sender = load_bundle("sender", args.sender_model, device)
+    receiver = load_bundle("receiver", args.receiver_model, device)
+    method = parse_method(args.method, args.slots_per_block)
+
+    train_s = collect_features(sender, train_full, args.max_length, device)
+    train_r = collect_features(receiver, train_full, args.max_length, device)
+    eval_s = collect_features(sender, eval_full, args.max_length, device)
+    eval_r = collect_features(receiver, eval_full, args.max_length, device)
+
+    per_layer = {}
+    for layer in range(receiver.model.config.num_hidden_layers):
+        train_items = build_cache_space_items(
+            train_s,
+            train_r,
+            None,
+            None,
+            layer,
+            args.block_size,
+            args.block_score_mode,
+            args.anchor_tokens,
+            args.budget_ratio,
+            method,
+            args.value_pool_mode,
+            device,
+            "pre_rope",
+        )
+        eval_items = build_cache_space_items(
+            eval_s,
+            eval_r,
+            None,
+            None,
+            layer,
+            args.block_size,
+            args.block_score_mode,
+            args.anchor_tokens,
+            args.budget_ratio,
+            method,
+            args.value_pool_mode,
+            device,
+            "pre_rope",
+        )
+        tk, tv, prep_input, denorm_pred = train_translators_return_models(
+            train_items,
+            method,
+            args.epochs,
+            args.lr,
+            args.hidden,
+            args.kv_loss_weight,
+            args.output_loss_weight,
+        )
+        per_layer[layer] = {"items": eval_items, "tk": tk, "tv": tv, "prep_input": prep_input, "denorm_pred": denorm_pred}
+        print(f"trained layer {layer:02d}")
+
+    rows = []
+    for sample_id, record in enumerate(eval_records):
+        full_ids, full_mask = encode_prompt(receiver.tokenizer, eval_full[sample_id], args.max_length, device)
+        query_ids, query_mask = encode_prompt(receiver.tokenizer, eval_query[sample_id], args.query_max_length, device)
+        full_new = greedy_full_receiver(receiver, full_ids, full_mask, args.max_new_tokens)
+        query_new = greedy_full_receiver(receiver, query_ids, query_mask, args.max_new_tokens)
+
+        memory_cache, memory_len = build_memory_prefix_cache(per_layer, sample_id, receiver.model, args.max_memory_slots)
+        query_cache = build_query_prefix_cache(receiver, query_ids, query_mask, memory_len)
+        hybrid_cache = concat_caches(memory_cache, query_cache, receiver.model)
+        hybrid_new = greedy_with_hybrid_cache(receiver, query_ids, hybrid_cache, memory_len, args.max_new_tokens)
+
+        full_ids_list = full_new[0].detach().cpu().tolist()
+        variants = {
+            "query_only": query_new,
+            "query_plus_sender_memory_prerope": hybrid_new,
+        }
+        full_text = receiver.tokenizer.decode(full_ids_list, skip_special_tokens=True)
+        for name, pred in variants.items():
+            pred_ids = pred[0].detach().cpu().tolist()
+            pred_text = receiver.tokenizer.decode(pred_ids, skip_special_tokens=True)
+            row = {
+                "sample_id": sample_id,
+                "variant": name,
+                "memory_slots": memory_len,
+                "query_tokens": int(query_mask.sum().item()),
+                "full_tokens": int(full_mask.sum().item()),
+                "max_new_tokens": args.max_new_tokens,
+                "first_token_match": int(bool(full_ids_list and pred_ids and full_ids_list[0] == pred_ids[0])),
+                "exact_match": int(full_ids_list == pred_ids),
+                "prefix_match_tokens": next((i for i, (a, b) in enumerate(zip(full_ids_list, pred_ids)) if a != b), min(len(full_ids_list), len(pred_ids))),
+                "token_f1": token_f1(pred_ids, full_ids_list),
+                "sequence_similarity": seq_similarity(pred_ids, full_ids_list),
+                "answer_contains": answer_contains(pred_text, record.get("answer", "")),
+                "full_continuation_ce": float(continuation_ce(receiver, full_new, full_ids, full_mask).cpu()),
+                "variant_continuation_ce": float(continuation_ce(receiver, pred, query_ids, query_mask).cpu()),
+                "answer": record.get("answer", "").replace("\n", "\\n"),
+                "full_text": full_text.replace("\n", "\\n"),
+                "variant_text": pred_text.replace("\n", "\\n"),
+            }
+            rows.append(row)
+            print(
+                f"sample={sample_id} {name} first={row['first_token_match']} exact={row['exact_match']} "
+                f"f1={row['token_f1']:.3f} sim={row['sequence_similarity']:.3f} answer={row['answer_contains']}"
+            )
+
+    os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
+    fieldnames = [
+        "sample_id",
+        "variant",
+        "memory_slots",
+        "query_tokens",
+        "full_tokens",
+        "max_new_tokens",
+        "first_token_match",
+        "exact_match",
+        "prefix_match_tokens",
+        "token_f1",
+        "sequence_similarity",
+        "answer_contains",
+        "full_continuation_ce",
+        "variant_continuation_ce",
+        "answer",
+        "full_text",
+        "variant_text",
+    ]
+    with open(args.csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["variant"], []).append(row)
+    summary_rows = []
+    for variant, vals in grouped.items():
+        summary_rows.append(
+            {
+                "variant": variant,
+                "n": len(vals),
+                "first_token_match": sum(float(x["first_token_match"]) for x in vals) / len(vals),
+                "exact_match": sum(float(x["exact_match"]) for x in vals) / len(vals),
+                "prefix_match_tokens": sum(float(x["prefix_match_tokens"]) for x in vals) / len(vals),
+                "token_f1": sum(float(x["token_f1"]) for x in vals) / len(vals),
+                "sequence_similarity": sum(float(x["sequence_similarity"]) for x in vals) / len(vals),
+                "answer_contains": sum(float(x["answer_contains"]) for x in vals) / len(vals),
+            }
+        )
+    with open(args.summary_csv, "w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variant", "n", "first_token_match", "exact_match", "prefix_match_tokens", "token_f1", "sequence_similarity", "answer_contains"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    print(f"Wrote CSV: {args.csv}")
+    print(f"Wrote summary CSV: {args.summary_csv}")
+
+
+if __name__ == "__main__":
+    main()

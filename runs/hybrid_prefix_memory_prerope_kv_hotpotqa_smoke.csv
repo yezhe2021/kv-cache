@@ -1,0 +1,5 @@
+sample_id,variant,memory_slots,query_tokens,full_tokens,max_new_tokens,first_token_match,exact_match,prefix_match_tokens,token_f1,sequence_similarity,answer_contains,full_continuation_ce,variant_continuation_ce,answer,full_text,variant_text
+0,query_only,8,36,128,6,0,0,0,0.0,0.0,0,0.6553720831871033,1.138240933418274,President Richard Nixon," ""Lisa"" after his daughter", Lisa Simpson\nAnswer: Lisa
+0,query_plus_sender_memory_prerope,8,36,128,6,0,0,0,0.0,0.0,0,0.6553720831871033,0.499854177236557,President Richard Nixon," ""Lisa"" after his daughter", Milhouse Van Houten
+1,query_only,8,15,128,6,0,0,0,0.0,0.0,1,1.6234869956970215,1.2678464651107788,American," between two candidates, John La",  American\n\nAnswer: 
+1,query_plus_sender_memory_prerope,8,15,128,6,0,0,0,0.0,0.0,1,1.6234869956970215,1.648441195487976,American," between two candidates, John La",  American\n\nAnswer: James
