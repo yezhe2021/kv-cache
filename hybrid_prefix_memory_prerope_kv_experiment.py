@@ -1,7 +1,8 @@
 """Hybrid prefix-memory pre-RoPE KV experiment.
 
 Sender selected memory blocks are translated as receiver pre-RoPE content KV.
-Receiver keeps its own short query KV. The final cache layout is:
+Receiver keeps its own short query prompt, but the query prompt is prefilled
+with the memory cache already attached. The final cache layout is:
 
     [translated sender memory prefix][receiver query prefix]
 
@@ -16,7 +17,6 @@ import argparse
 import csv
 import json
 import os
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -34,15 +34,23 @@ from kv_cache_sharing_generation_experiment import (
     token_f1,
     translated_slots,
 )
-from run_suffix_output_patch_prefill_split_experiment import load_dataset_texts
 
 
 def format_hotpot_prompt(record):
-    return f"Context:\n{record['context']}\n\nQuestion: {record['question']}\nAnswer:"
+    return (
+        "Answer the question using the context. Give the short answer only.\n\n"
+        f"Context:\n{record['context']}\n\n"
+        f"Question:\n{record['question']}\n\n"
+        "Short answer:"
+    )
 
 
 def format_hotpot_query(record):
-    return f"Question: {record['question']}\nAnswer:"
+    return (
+        "Answer the question. Give the short answer only.\n\n"
+        f"Question:\n{record['question']}\n\n"
+        "Short answer:"
+    )
 
 
 def load_hotpot_records(path, limit):
@@ -64,6 +72,10 @@ def load_hotpot_records(path, limit):
 def encode_prompt(tokenizer, text, max_length, device):
     enc = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
     return enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+
+def token_count(tokenizer, text):
+    return int(tokenizer(text, truncation=False, return_tensors="pt")["input_ids"].shape[1])
 
 
 def continuation_ce(receiver, generated_ids, input_ids, attention_mask):
@@ -123,43 +135,33 @@ def build_memory_prefix_cache(per_layer, sample_id, receiver_model, max_memory_s
 
 
 @torch.no_grad()
-def build_query_prefix_cache(receiver, query_ids, query_mask, memory_len):
-    prefix_ids = query_ids[:, :-1]
-    prefix_mask = query_mask[:, :-1]
-    if prefix_ids.shape[1] == 0:
-        return None
-    position_ids = torch.arange(memory_len, memory_len + prefix_ids.shape[1], device=query_ids.device).unsqueeze(0)
-    out = receiver.model(
-        input_ids=prefix_ids,
-        attention_mask=prefix_mask,
+def prefill_query_with_memory_cache(receiver, query_ids, memory_cache, memory_len):
+    device = query_ids.device
+    query_len = query_ids.shape[1]
+    attention_mask = torch.ones((1, memory_len + query_len), dtype=torch.long, device=device)
+    position_ids = torch.arange(memory_len, memory_len + query_len, device=device).unsqueeze(0)
+    return receiver.model(
+        input_ids=query_ids,
+        attention_mask=attention_mask,
         position_ids=position_ids,
+        past_key_values=memory_cache,
         use_cache=True,
     )
-    return out.past_key_values
-
-
-def concat_caches(memory_cache, query_cache, receiver_model):
-    if query_cache is None:
-        return memory_cache
-    cache_data = []
-    for mem_layer, query_layer in zip(memory_cache.layers, query_cache.layers):
-        k = torch.cat([mem_layer.keys, query_layer.keys], dim=2).to(receiver_model.dtype).contiguous()
-        v = torch.cat([mem_layer.values, query_layer.values], dim=2).to(receiver_model.dtype).contiguous()
-        cache_data.append((k, v))
-    return DynamicCache(ddp_cache_data=cache_data, config=receiver_model.config)
 
 
 @torch.no_grad()
-def greedy_with_hybrid_cache(receiver, query_ids, cache, memory_len, max_new_tokens):
+def greedy_from_conditioned_prefill(receiver, prefill_out, memory_len, query_len, max_new_tokens):
     generated = []
-    cur = query_ids[:, -1:]
-    device = query_ids.device
-    query_len = query_ids.shape[1]
+    cur = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
+    generated.append(cur)
+    cache = prefill_out.past_key_values
+    device = cur.device
 
-    for step in range(max_new_tokens):
+    while len(generated) < max_new_tokens:
+        step = len(generated)
         cache_len = cache.get_seq_length()
         attention_mask = torch.ones((1, cache_len + 1), dtype=torch.long, device=device)
-        position_ids = torch.tensor([[memory_len + query_len - 1 + step]], dtype=torch.long, device=device)
+        position_ids = torch.tensor([[memory_len + query_len + step - 1]], dtype=torch.long, device=device)
         out = receiver.model(
             input_ids=cur,
             attention_mask=attention_mask,
@@ -185,11 +187,11 @@ def main():
     parser.add_argument("--dataset_path", default="/home/yezhe/数据集/HotpotQA/processed/hotpot_train_context_qa.jsonl")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_train", type=int, default=4)
-    parser.add_argument("--num_eval", type=int, default=4)
-    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--num_eval", type=int, default=8)
+    parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--query_max_length", type=int, default=96)
-    parser.add_argument("--max_new_tokens", type=int, default=12)
-    parser.add_argument("--max_memory_slots", type=int, default=64)
+    parser.add_argument("--max_new_tokens", type=int, default=48)
+    parser.add_argument("--max_memory_slots", type=int, default=96)
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--budget_ratio", type=float, default=0.5)
     parser.add_argument("--block_score_mode", default="anchor_count")
@@ -269,22 +271,26 @@ def main():
 
     rows = []
     for sample_id, record in enumerate(eval_records):
+        full_untruncated_tokens = token_count(receiver.tokenizer, eval_full[sample_id])
+        query_untruncated_tokens = token_count(receiver.tokenizer, eval_query[sample_id])
         full_ids, full_mask = encode_prompt(receiver.tokenizer, eval_full[sample_id], args.max_length, device)
         query_ids, query_mask = encode_prompt(receiver.tokenizer, eval_query[sample_id], args.query_max_length, device)
         full_new = greedy_full_receiver(receiver, full_ids, full_mask, args.max_new_tokens)
         query_new = greedy_full_receiver(receiver, query_ids, query_mask, args.max_new_tokens)
 
         memory_cache, memory_len = build_memory_prefix_cache(per_layer, sample_id, receiver.model, args.max_memory_slots)
-        query_cache = build_query_prefix_cache(receiver, query_ids, query_mask, memory_len)
-        hybrid_cache = concat_caches(memory_cache, query_cache, receiver.model)
-        hybrid_new = greedy_with_hybrid_cache(receiver, query_ids, hybrid_cache, memory_len, args.max_new_tokens)
+        hybrid_prefill = prefill_query_with_memory_cache(receiver, query_ids, memory_cache, memory_len)
+        hybrid_new = greedy_from_conditioned_prefill(receiver, hybrid_prefill, memory_len, query_ids.shape[1], args.max_new_tokens)
 
         full_ids_list = full_new[0].detach().cpu().tolist()
+        full_text = receiver.tokenizer.decode(full_ids_list, skip_special_tokens=True)
+        full_answer_contains = answer_contains(full_text, record.get("answer", ""))
+        full_context_truncated = int(full_untruncated_tokens > args.max_length)
+        query_truncated = int(query_untruncated_tokens > args.query_max_length)
         variants = {
             "query_only": query_new,
-            "query_plus_sender_memory_prerope": hybrid_new,
+            "query_plus_sender_memory_conditioned_prerope": hybrid_new,
         }
-        full_text = receiver.tokenizer.decode(full_ids_list, skip_special_tokens=True)
         for name, pred in variants.items():
             pred_ids = pred[0].detach().cpu().tolist()
             pred_text = receiver.tokenizer.decode(pred_ids, skip_special_tokens=True)
@@ -294,6 +300,10 @@ def main():
                 "memory_slots": memory_len,
                 "query_tokens": int(query_mask.sum().item()),
                 "full_tokens": int(full_mask.sum().item()),
+                "full_untruncated_tokens": full_untruncated_tokens,
+                "query_untruncated_tokens": query_untruncated_tokens,
+                "full_context_truncated": full_context_truncated,
+                "query_truncated": query_truncated,
                 "max_new_tokens": args.max_new_tokens,
                 "first_token_match": int(bool(full_ids_list and pred_ids and full_ids_list[0] == pred_ids[0])),
                 "exact_match": int(full_ids_list == pred_ids),
@@ -301,6 +311,8 @@ def main():
                 "token_f1": token_f1(pred_ids, full_ids_list),
                 "sequence_similarity": seq_similarity(pred_ids, full_ids_list),
                 "answer_contains": answer_contains(pred_text, record.get("answer", "")),
+                "full_answer_contains": full_answer_contains,
+                "full_baseline_failed": int(not bool(full_answer_contains)),
                 "full_continuation_ce": float(continuation_ce(receiver, full_new, full_ids, full_mask).cpu()),
                 "variant_continuation_ce": float(continuation_ce(receiver, pred, query_ids, query_mask).cpu()),
                 "answer": record.get("answer", "").replace("\n", "\\n"),
@@ -310,7 +322,8 @@ def main():
             rows.append(row)
             print(
                 f"sample={sample_id} {name} first={row['first_token_match']} exact={row['exact_match']} "
-                f"f1={row['token_f1']:.3f} sim={row['sequence_similarity']:.3f} answer={row['answer_contains']}"
+                f"f1={row['token_f1']:.3f} sim={row['sequence_similarity']:.3f} "
+                f"answer={row['answer_contains']} full_answer={row['full_answer_contains']}"
             )
 
     os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
@@ -320,6 +333,10 @@ def main():
         "memory_slots",
         "query_tokens",
         "full_tokens",
+        "full_untruncated_tokens",
+        "query_untruncated_tokens",
+        "full_context_truncated",
+        "query_truncated",
         "max_new_tokens",
         "first_token_match",
         "exact_match",
@@ -327,6 +344,8 @@ def main():
         "token_f1",
         "sequence_similarity",
         "answer_contains",
+        "full_answer_contains",
+        "full_baseline_failed",
         "full_continuation_ce",
         "variant_continuation_ce",
         "answer",
@@ -343,20 +362,42 @@ def main():
         grouped.setdefault(row["variant"], []).append(row)
     summary_rows = []
     for variant, vals in grouped.items():
+        full_correct = [x for x in vals if float(x["full_answer_contains"]) > 0]
         summary_rows.append(
             {
                 "variant": variant,
                 "n": len(vals),
+                "n_full_correct": len(full_correct),
+                "full_baseline_answer_rate": sum(float(x["full_answer_contains"]) for x in vals) / len(vals),
+                "full_context_truncation_rate": sum(float(x["full_context_truncated"]) for x in vals) / len(vals),
                 "first_token_match": sum(float(x["first_token_match"]) for x in vals) / len(vals),
                 "exact_match": sum(float(x["exact_match"]) for x in vals) / len(vals),
                 "prefix_match_tokens": sum(float(x["prefix_match_tokens"]) for x in vals) / len(vals),
                 "token_f1": sum(float(x["token_f1"]) for x in vals) / len(vals),
                 "sequence_similarity": sum(float(x["sequence_similarity"]) for x in vals) / len(vals),
                 "answer_contains": sum(float(x["answer_contains"]) for x in vals) / len(vals),
+                "answer_contains_when_full_correct": (
+                    sum(float(x["answer_contains"]) for x in full_correct) / len(full_correct)
+                    if full_correct
+                    else 0.0
+                ),
             }
         )
     with open(args.summary_csv, "w", newline="", encoding="utf-8") as f:
-        fieldnames = ["variant", "n", "first_token_match", "exact_match", "prefix_match_tokens", "token_f1", "sequence_similarity", "answer_contains"]
+        fieldnames = [
+            "variant",
+            "n",
+            "n_full_correct",
+            "full_baseline_answer_rate",
+            "full_context_truncation_rate",
+            "first_token_match",
+            "exact_match",
+            "prefix_match_tokens",
+            "token_f1",
+            "sequence_similarity",
+            "answer_contains",
+            "answer_contains_when_full_correct",
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
